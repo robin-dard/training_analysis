@@ -7,6 +7,7 @@ data/strava_streams/
 data/*.json
 data/*.parquet
 data/*.html
+data/races/races.json
 
 # Sync state & token caches
 .garmin_state.json
