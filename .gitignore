@@ -1,0 +1,25 @@
+# Credentials
+.env
+
+# Downloaded data and generated outputs
+data/fit/
+data/strava_streams/
+data/*.json
+data/*.parquet
+data/*.html
+
+# Sync state & token caches
+.garmin_state.json
+.strava_token_cache.json
+.strava_streams_state.json
+
+# Editor / tool settings
+.claude/
+.vscode/
+*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
