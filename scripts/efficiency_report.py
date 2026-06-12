@@ -3,13 +3,15 @@ scripts/efficiency_report.py
 
 Generate data/efficiency_report.html.
 
-Analyses two session types:
-  - Track: detect work intervals, compute speed/HR efficiency per block
-  - Hills: detect structured repeats (D+ 400-900m, >= 3 reps), compute asc_speed/HR
+Two session types:
+  - Track  : detect work intervals (FIT laps preferred, speed threshold fallback)
+  - Hills  : detect structured repeats (D+ 400-900m, >= 3, similar D+)
 
-Also produces zone-speed progression (track only) — median speed per HR zone by year.
+Zone-speed progression (track only) — median speed per HR zone, by year.
+Cache at data/efficiency_cache.json; first run ~10 min, subsequent runs instant.
 
-Cache at data/efficiency_cache.json prevents re-parsing FIT files on subsequent runs.
+Run with --rebuild-cache to force re-parse of all sessions (needed after any
+change to detection parameters or when altitude was missing from old cache).
 """
 
 from __future__ import annotations
@@ -28,21 +30,22 @@ sys.path.insert(0, str(_ROOT))
 from analysis.efficiency import (
     detect_hill_repeats,
     detect_track_intervals,
+    detect_track_intervals_from_laps,
     zone_speed_ms,
 )
 from analysis.hr_analysis import DEFAULT_HR_ZONES, DEFAULT_MAX_HR
-from parsers.fit_parser import parse_fit_file
+from parsers.fit_parser import fit_metadata, parse_fit_file, parse_fit_laps
 
 SUMMARIES    = _ROOT / "data/summaries.parquet"
 FIT_DIR      = _ROOT / "data/fit"
 CACHE_FILE   = _ROOT / "data/efficiency_cache.json"
 OUT_HTML     = _ROOT / "data/efficiency_report.html"
 
-# Trail sessions need at least 3 x 400m = 1200m D+ to be candidates
 _HILL_MIN_DPLUS = 1200.0
+_TS_STEP_S      = 10
 
-# Downsample time series to this resolution for embedded chart data
-_TS_STEP_S = 10
+# Cache schema version — bump when cache format changes to force rebuild
+_CACHE_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -51,55 +54,116 @@ _TS_STEP_S = 10
 
 def _load_cache() -> dict:
     if CACHE_FILE.exists():
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-    return {"track": {}, "hills": {}}
+        c = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if c.get("_version") == _CACHE_VERSION:
+            return c
+    return {"_version": _CACHE_VERSION, "track": {}, "hills": {}}
 
 
 def _save_cache(cache: dict) -> None:
-    CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    CACHE_FILE.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Strava name lookup (date-based)
+# ---------------------------------------------------------------------------
+
+def _load_strava_names() -> dict[str, list[str]]:
+    """
+    Load Strava metadata and build {date_str: [name, ...]} lookup.
+
+    Multiple activities can occur on the same date, so we keep a list.
+    Date matching is the primary join key between Garmin FIT and Strava.
+    """
+    meta_file = _ROOT / "data/strava_streams/metadata.json"
+    if not meta_file.exists():
+        return {}
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        result: dict[str, list[str]] = {}
+        for _, m in meta.items():
+            date = str(m.get("date", ""))[:10]
+            name = (m.get("name") or "").strip()
+            if date and name:
+                result.setdefault(date, []).append(name)
+        return result
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Time-series downsampling
+# ---------------------------------------------------------------------------
+
+def _downsample(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "elapsed_s" not in df.columns:
+        return df
+    df = df.copy()
+    df["_bucket"] = (df["elapsed_s"] / _TS_STEP_S).astype(int)
+    return df.groupby("_bucket", sort=True).last().reset_index(drop=True)
+
+
+def _ts_arrays(df: pd.DataFrame, include_alt: bool = False) -> dict:
+    ds = _downsample(df)
+    t     = ds["elapsed_s"].round(0).astype(int).tolist() if "elapsed_s" in ds.columns else []
+    speed = ([round(v * 3.6, 2) if pd.notna(v) else None for v in ds["speed_ms"]]
+             if "speed_ms" in ds.columns else [])
+    hr    = ([round(v, 0) if pd.notna(v) else None for v in ds["heart_rate"]]
+             if "heart_rate" in ds.columns else [])
+    out: dict = {"t": t, "speed_kmh": speed, "hr": hr}
+    if include_alt and "altitude_m" in ds.columns:
+        out["alt"] = [round(v, 0) if pd.notna(v) else None for v in ds["altitude_m"]]
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Session processing
 # ---------------------------------------------------------------------------
 
-def _downsample(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep every _TS_STEP_S row to reduce embedded data size."""
-    if df.empty or "elapsed_s" not in df.columns:
-        return df
-    step = _TS_STEP_S
-    df = df.copy()
-    df["_bucket"] = (df["elapsed_s"] / step).astype(int)
-    return df.groupby("_bucket", sort=True).last().reset_index(drop=True)
+def _session_name(fit_path: Path, date_str: str, strava_names: dict[str, list[str]]) -> str:
+    """Return the best available session name: FIT workout name > Strava name."""
+    try:
+        meta = fit_metadata(fit_path)
+        wkt = (meta.get("workout_name") or "").strip()
+        if wkt:
+            return wkt
+    except Exception:
+        pass
+    names = strava_names.get(date_str, [])
+    return names[0] if names else ""
 
 
-def _ts_arrays(df: pd.DataFrame) -> dict:
-    """Extract time series arrays for chart embedding."""
-    ds = _downsample(df)
-    t = ds["elapsed_s"].round(0).astype(int).tolist() if "elapsed_s" in ds.columns else []
-    speed = [round(v * 3.6, 2) if pd.notna(v) else None
-             for v in ds.get("speed_ms", pd.Series())] if "speed_ms" in ds.columns else []
-    hr = [round(v, 0) if pd.notna(v) else None
-          for v in ds.get("heart_rate", pd.Series())] if "heart_rate" in ds.columns else []
-    return {"t": t, "speed_kmh": speed, "hr": hr}
-
-
-def _process_track(fit_path: Path) -> dict | None:
-    """Parse FIT, detect intervals, compute zone speeds. Returns None on error."""
+def _process_track(fit_path: Path, strava_names: dict) -> dict | None:
+    """Parse FIT, detect intervals (laps preferred), compute zone speeds."""
     try:
         df = parse_fit_file(fit_path)
     except Exception as e:
         print(f"  [skip] {fit_path.name}: {e}")
         return None
 
-    intervals = detect_track_intervals(df)
+    # Try structured lap data first
+    used_laps = False
+    try:
+        laps_df = parse_fit_laps(fit_path)
+        if not laps_df.empty and (laps_df["intensity"] == "active").any():
+            intervals = detect_track_intervals_from_laps(laps_df)
+            used_laps = True
+        else:
+            intervals = detect_track_intervals(df)
+    except Exception:
+        intervals = detect_track_intervals(df)
+
     work = [i for i in intervals if i.is_work]
     if not work:
         return None
 
-    zone_sp = zone_speed_ms(df, max_hr=DEFAULT_MAX_HR, zones=DEFAULT_HR_ZONES)
+    eff_vals = [i.efficiency for i in work if i.efficiency]
+    zone_sp  = zone_speed_ms(df, max_hr=DEFAULT_MAX_HR, zones=DEFAULT_HR_ZONES)
+    date_str = fit_path.stem[:10]
 
     return {
+        "name": _session_name(fit_path, date_str, strava_names),
+        "used_laps": used_laps,
         "intervals": [
             {
                 "start_s": i.start_s, "end_s": i.end_s, "is_work": i.is_work,
@@ -111,19 +175,14 @@ def _process_track(fit_path: Path) -> dict | None:
             for i in intervals
         ],
         "work_count": len(work),
-        "mean_efficiency": (
-            round(sum(i.efficiency for i in work if i.efficiency) / len(work), 5)
-            if work else None
-        ),
-        "zone_speeds_kmh": {
-            k: round(v * 3.6, 2) if v else None for k, v in zone_sp.items()
-        },
+        "mean_efficiency": round(sum(eff_vals) / len(eff_vals), 5) if eff_vals else None,
+        "zone_speeds_kmh": {k: round(v * 3.6, 2) if v else None for k, v in zone_sp.items()},
         "ts": _ts_arrays(df),
     }
 
 
-def _process_hills(fit_path: Path) -> dict | None:
-    """Parse FIT, detect hill repeats. Returns None on error or no repeats."""
+def _process_hills(fit_path: Path, strava_names: dict) -> dict | None:
+    """Parse FIT, detect hill repeats (with altitude in ts)."""
     try:
         df = parse_fit_file(fit_path)
     except Exception as e:
@@ -132,18 +191,19 @@ def _process_hills(fit_path: Path) -> dict | None:
 
     repeats = detect_hill_repeats(df)
     if not repeats:
-        return {"no_repeats": True}  # cached as negative result
+        return {"no_repeats": True}
 
     eff_vals = [r.efficiency for r in repeats if r.efficiency is not None]
+    date_str = fit_path.stem[:10]
 
     return {
+        "name": _session_name(fit_path, date_str, strava_names),
         "repeats": [
             {
                 "repeat_num": r.repeat_num,
                 "start_s": r.start_s, "end_s": r.end_s,
                 "duration_s": round(r.duration_s, 0),
-                "dplus_m": r.dplus_m,
-                "dist_m": r.dist_m,
+                "dplus_m": r.dplus_m, "dist_m": r.dist_m,
                 "avg_grade_pct": r.avg_grade_pct,
                 "asc_speed_mh": r.asc_speed_mh,
                 "mean_hr": r.mean_hr,
@@ -153,7 +213,7 @@ def _process_hills(fit_path: Path) -> dict | None:
         ],
         "repeat_count": len(repeats),
         "mean_efficiency": round(sum(eff_vals) / len(eff_vals), 3) if eff_vals else None,
-        "ts": _ts_arrays(df),
+        "ts": _ts_arrays(df, include_alt=True),
     }
 
 
@@ -162,7 +222,6 @@ def _process_hills(fit_path: Path) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def build_cache(rebuild: bool = False) -> dict:
-    """Process all track and trail-repeat sessions, update cache."""
     cache = {} if rebuild else _load_cache()
     if "track" not in cache:
         cache["track"] = {}
@@ -174,6 +233,7 @@ def build_cache(rebuild: bool = False) -> dict:
         sys.exit(1)
 
     df = pd.read_parquet(SUMMARIES)
+    strava_names = _load_strava_names()
 
     # Track sessions
     track_df = df[df["sport"] == "track_running"].copy()
@@ -184,10 +244,10 @@ def build_cache(rebuild: bool = False) -> dict:
     if track_new:
         print(f"Track sessions: {len(track_new)} new to process ({len(track_df)} total)...")
         for row in tqdm(track_new, desc="Track", unit="session"):
-            fit_path = FIT_DIR / row["file"]
-            if not fit_path.exists():
+            fp = FIT_DIR / row["file"]
+            if not fp.exists():
                 continue
-            result = _process_track(fit_path)
+            result = _process_track(fp, strava_names)
             date_str = str(row.get("date", ""))[:10]
             cache["track"][row["file"]] = {
                 "date": date_str,
@@ -198,7 +258,7 @@ def build_cache(rebuild: bool = False) -> dict:
     else:
         print(f"Track sessions: 0 new (cache has {len(cache['track'])} sessions).")
 
-    # Hill repeat candidates: trail sessions with enough D+
+    # Hill candidates
     hill_candidates = df[
         (df["sport"] == "trail_running") &
         (df["dplus_m"].fillna(0) >= _HILL_MIN_DPLUS)
@@ -210,10 +270,10 @@ def build_cache(rebuild: bool = False) -> dict:
     if hills_new:
         print(f"Hill candidates: {len(hills_new)} new to check ({len(hill_candidates)} total)...")
         for row in tqdm(hills_new, desc="Hills", unit="session"):
-            fit_path = FIT_DIR / row["file"]
-            if not fit_path.exists():
+            fp = FIT_DIR / row["file"]
+            if not fp.exists():
                 continue
-            result = _process_hills(fit_path)
+            result = _process_hills(fp, strava_names)
             date_str = str(row.get("date", ""))[:10]
             cache["hills"][row["file"]] = {
                 "date": date_str,
@@ -230,15 +290,8 @@ def build_cache(rebuild: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# HTML generation
+# HTML rendering
 # ---------------------------------------------------------------------------
-
-def _fmt_min(seconds: float | None) -> str:
-    if seconds is None:
-        return "—"
-    m, s = divmod(int(seconds), 60)
-    return f"{m}:{s:02d}"
-
 
 def _fmt_hms(seconds: float | None) -> str:
     if seconds is None:
@@ -249,104 +302,104 @@ def _fmt_hms(seconds: float | None) -> str:
 
 
 def _zone_color(zone: str) -> str:
-    colors = {
+    return {
         "Z1_recovery":  "#74b9ff",
         "Z2_aerobic":   "#00b894",
         "Z3_tempo":     "#fdcb6e",
         "Z4_threshold": "#e17055",
         "Z5_vo2max":    "#d63031",
-    }
-    return colors.get(zone, "#636e72")
+    }.get(zone, "#636e72")
 
 
 def render_html(cache: dict) -> str:
-    # Build track session objects (only those with work intervals)
-    track_sessions = {}
-    for fname, data in sorted(cache.get("track", {}).items()):
-        if data.get("no_intervals") or not data.get("intervals"):
-            continue
-        work = [i for i in data["intervals"] if i["is_work"] and i.get("efficiency")]
-        if not work:
-            continue
-        track_sessions[fname] = data
-
-    # Build hill session objects (only those with repeats)
-    hill_sessions = {}
-    for fname, data in sorted(cache.get("hills", {}).items()):
-        if data.get("no_repeats") or not data.get("repeats"):
-            continue
-        hill_sessions[fname] = data
+    # Filter sessions with real results
+    track_sessions = {
+        f: d for f, d in sorted(cache.get("track", {}).items())
+        if not d.get("no_intervals") and d.get("intervals")
+        and any(i["is_work"] and i.get("efficiency") for i in d["intervals"])
+    }
+    hill_sessions = {
+        f: d for f, d in sorted(cache.get("hills", {}).items())
+        if not d.get("no_repeats") and d.get("repeats")
+    }
 
     # Zone speed by year (track only)
     zone_by_year: dict[int, dict[str, list[float]]] = {}
-    for fname, data in track_sessions.items():
-        year = int(data["date"][:4]) if len(data.get("date", "")) >= 4 else 0
-        if year < 2018:
+    for d in track_sessions.values():
+        yr = int(d["date"][:4]) if len(d.get("date", "")) >= 4 else 0
+        if yr < 2018:
             continue
-        if year not in zone_by_year:
-            zone_by_year[year] = {z: [] for z in DEFAULT_HR_ZONES}
-        zs = data.get("zone_speeds_kmh", {})
-        for z in DEFAULT_HR_ZONES:
-            v = zs.get(z)
+        zone_by_year.setdefault(yr, {z: [] for z in DEFAULT_HR_ZONES})
+        for z, v in d.get("zone_speeds_kmh", {}).items():
             if v:
-                zone_by_year[year][z].append(v)
+                zone_by_year[yr][z].append(v)
 
     zone_years = sorted(zone_by_year)
-    zone_series: dict[str, list[float | None]] = {z: [] for z in DEFAULT_HR_ZONES}
-    for yr in zone_years:
-        for z in DEFAULT_HR_ZONES:
-            vals = zone_by_year[yr].get(z, [])
-            zone_series[z].append(round(sum(vals) / len(vals), 2) if vals else None)
+    zone_series = {
+        z: [
+            (round(sum(zone_by_year[yr][z]) / len(zone_by_year[yr][z]), 2)
+             if zone_by_year[yr].get(z) else None)
+            for yr in zone_years
+        ]
+        for z in DEFAULT_HR_ZONES
+    }
 
-    # Efficiency trend series
     track_trend = [
-        {"date": d["date"], "eff": d["mean_efficiency"], "file": f,
-         "n": d.get("work_count", 0)}
+        {"date": d["date"], "eff": d["mean_efficiency"], "file": f, "n": d.get("work_count", 0),
+         "name": d.get("name", "")}
         for f, d in sorted(track_sessions.items(), key=lambda x: x[1]["date"])
         if d.get("mean_efficiency")
     ]
     hill_trend = [
-        {"date": d["date"], "eff": d["mean_efficiency"], "file": f,
-         "n": d.get("repeat_count", 0)}
+        {"date": d["date"], "eff": d["mean_efficiency"], "file": f, "n": d.get("repeat_count", 0),
+         "name": d.get("name", "")}
         for f, d in sorted(hill_sessions.items(), key=lambda x: x[1]["date"])
         if d.get("mean_efficiency")
     ]
 
-    # Sidebar items
-    def track_item(fname: str, d: dict) -> str:
-        eff = d.get("mean_efficiency")
-        eff_str = f"{eff*1000:.2f}" if eff else "—"
-        return (
-            f'<div class="sess-item" data-type="track" data-file="{fname}" '
-            f'onclick="selectSession(this,\'track\')">'
-            f'<span class="sess-date">{d["date"]}</span>'
-            f'<span class="sess-meta">{d.get("work_count",0)} blocs · {eff_str} eff</span>'
-            f'</div>'
-        )
-
-    def hill_item(fname: str, d: dict) -> str:
-        eff = d.get("mean_efficiency")
-        eff_str = f"{eff:.2f}" if eff else "—"
-        n = d.get("repeat_count", 0)
-        return (
-            f'<div class="sess-item" data-type="hills" data-file="{fname}" '
-            f'onclick="selectSession(this,\'hills\')">'
-            f'<span class="sess-date">{d["date"]}</span>'
-            f'<span class="sess-meta">{n} reps · {eff_str} eff</span>'
-            f'</div>'
-        )
-
-    track_sidebar = "\n".join(track_item(f, d) for f, d in sorted(track_sessions.items(), key=lambda x: x[1]["date"], reverse=True))
-    hill_sidebar  = "\n".join(hill_item(f, d) for f, d in sorted(hill_sessions.items(), key=lambda x: x[1]["date"], reverse=True))
-
     zone_colors = {z: _zone_color(z) for z in DEFAULT_HR_ZONES}
     zone_labels = {
-        "Z1_recovery": "Z1 Récup",
-        "Z2_aerobic": "Z2 Aérobie",
-        "Z3_tempo": "Z3 Tempo",
-        "Z4_threshold": "Z4 Seuil",
+        "Z1_recovery": "Z1 Récup", "Z2_aerobic": "Z2 Aérobie",
+        "Z3_tempo": "Z3 Tempo",   "Z4_threshold": "Z4 Seuil",
         "Z5_vo2max": "Z5 VO2max",
     }
+
+    # Sidebar items
+    def track_item(fname, d):
+        eff = d.get("mean_efficiency")
+        eff_s = f"{eff*1000:.2f}" if eff else "—"
+        laps_mark = "●" if d.get("used_laps") else "○"
+        name = d.get("name", "")
+        name_line = f'<span class="sess-name">{name}</span>' if name else ""
+        return (
+            f'<div class="sess-item" data-file="{fname}" onclick="selectSession(this,\'track\')">'
+            f'<span class="sess-date">{d["date"]} {laps_mark}</span>'
+            f'{name_line}'
+            f'<span class="sess-meta">{d.get("work_count",0)} blocs · {eff_s} vit/FC</span>'
+            f'</div>'
+        )
+
+    def hill_item(fname, d):
+        eff = d.get("mean_efficiency")
+        eff_s = f"{eff:.2f}" if eff else "—"
+        name = d.get("name", "")
+        name_line = f'<span class="sess-name">{name}</span>' if name else ""
+        return (
+            f'<div class="sess-item" data-file="{fname}" onclick="selectSession(this,\'hills\')">'
+            f'<span class="sess-date">{d["date"]}</span>'
+            f'{name_line}'
+            f'<span class="sess-meta">{d.get("repeat_count",0)} reps · {eff_s} asc/FC</span>'
+            f'</div>'
+        )
+
+    track_sidebar = "\n".join(
+        track_item(f, d)
+        for f, d in sorted(track_sessions.items(), key=lambda x: x[1]["date"], reverse=True)
+    )
+    hill_sidebar = "\n".join(
+        hill_item(f, d)
+        for f, d in sorted(hill_sessions.items(), key=lambda x: x[1]["date"], reverse=True)
+    )
 
     sessions_js = json.dumps(
         {**{f"track:{k}": v for k, v in track_sessions.items()},
@@ -377,43 +430,42 @@ def render_html(cache: dict) -> str:
   .tab.active {{ background: #3d4775; border-color: #6c7aff; color: #fff; }}
   .layout {{ display: flex; flex: 1; overflow: hidden; }}
 
-  /* Sidebar */
   .sidebar {{ width: 240px; border-right: 1px solid #2d3142; background: #13151f;
               display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }}
   .sidebar-header {{ padding: 10px 14px; font-size: 11px; font-weight: 600;
                      color: #6b7089; text-transform: uppercase; letter-spacing: .8px;
                      border-bottom: 1px solid #2d3142; }}
   .sidebar-list {{ flex: 1; overflow-y: auto; }}
-  .sess-item {{ padding: 10px 14px; cursor: pointer; border-bottom: 1px solid #1e2030;
+  .sess-item {{ padding: 8px 14px; cursor: pointer; border-bottom: 1px solid #1e2030;
                 transition: background .1s; }}
   .sess-item:hover {{ background: #1e2133; }}
   .sess-item.active {{ background: #2a3050; border-left: 3px solid #6c7aff; }}
-  .sess-date {{ display: block; font-size: 13px; font-weight: 500; color: #cdd0e8; }}
+  .sess-date {{ display: block; font-size: 12px; font-weight: 500; color: #cdd0e8; }}
+  .sess-name {{ display: block; font-size: 12px; color: #a0a8d8; margin-top: 2px;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   .sess-meta {{ display: block; font-size: 11px; color: #5c6080; margin-top: 2px; }}
 
-  /* Main panel */
   .main {{ flex: 1; overflow-y: auto; padding: 20px 24px; }}
   .panel {{ display: none; }}
   .panel.active {{ display: block; }}
-  .overview-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }}
-  @media (max-width: 900px) {{ .overview-grid {{ grid-template-columns: 1fr; }} }}
+  .overview-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }}
 
-  /* Cards */
   .card {{ background: #1a1d27; border: 1px solid #2d3142; border-radius: 10px;
-           padding: 16px 20px; }}
+           padding: 16px 20px; margin-bottom: 16px; }}
   .card-title {{ font-size: 12px; font-weight: 600; color: #6b7089;
                  text-transform: uppercase; letter-spacing: .7px; margin-bottom: 10px; }}
   .chart-wrap {{ position: relative; height: 220px; }}
   .chart-wrap-tall {{ position: relative; height: 280px; }}
-  h2.sess-heading {{ font-size: 18px; color: #fff; margin-bottom: 4px; }}
-  .sess-subheading {{ font-size: 13px; color: #6b7089; margin-bottom: 16px; }}
-  .stat-row {{ display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px; }}
+
+  h2.sess-heading {{ font-size: 17px; color: #fff; margin-bottom: 2px; }}
+  .sess-label {{ font-size: 13px; color: #a0a8d8; margin-bottom: 4px; }}
+  .sess-subheading {{ font-size: 12px; color: #6b7089; margin-bottom: 14px; }}
+  .stat-row {{ display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 18px; }}
   .stat {{ text-align: center; min-width: 80px; }}
   .stat-val {{ font-size: 22px; font-weight: 700; color: #6c7aff; }}
   .stat-lbl {{ font-size: 11px; color: #5c6080; margin-top: 2px; }}
   .no-data {{ color: #5c6080; font-style: italic; padding: 40px 0; text-align: center; font-size: 14px; }}
 
-  /* Interval table */
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }}
   th {{ text-align: left; padding: 6px 10px; color: #6b7089; font-weight: 600;
         font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
@@ -423,87 +475,78 @@ def render_html(cache: dict) -> str:
   tr:hover {{ background: rgba(255,255,255,.03); }}
   .eff-badge {{ display: inline-block; padding: 2px 7px; border-radius: 4px;
                 font-size: 12px; font-weight: 600; }}
+  .laps-badge {{ font-size: 10px; padding: 1px 6px; border-radius: 3px;
+                 background: rgba(108,122,255,.25); color: #a0b0ff; margin-left: 6px; }}
 </style>
 </head>
 <body>
 <header>
   <h1>Efficiency Report</h1>
   <div class="tab-bar">
-    <button class="tab active" onclick="switchTab('track')">Track</button>
-    <button class="tab" onclick="switchTab('hills')">Hills</button>
-    <button class="tab" onclick="switchTab('zones')">Zone Speed</button>
+    <button class="tab active" onclick="switchTab('track',event)">Track</button>
+    <button class="tab" onclick="switchTab('hills',event)">Hills</button>
+    <button class="tab" onclick="switchTab('zones',event)">Zone Speed</button>
   </div>
 </header>
 <div class="layout">
-  <!-- Sidebar -->
   <nav class="sidebar">
-    <div class="sidebar-header" id="sidebar-label">Track Sessions ({len(track_sessions)})</div>
-    <div class="sidebar-list" id="sidebar-track">
-{track_sidebar}
-    </div>
-    <div class="sidebar-list" id="sidebar-hills" style="display:none">
-{hill_sidebar}
-    </div>
+    <div class="sidebar-header" id="sidebar-label">Track ({len(track_sessions)})</div>
+    <div class="sidebar-list" id="sidebar-track">{track_sidebar}</div>
+    <div class="sidebar-list" id="sidebar-hills" style="display:none">{hill_sidebar}</div>
   </nav>
-
-  <!-- Main panel -->
   <main class="main">
-    <!-- TRACK panel -->
+    <!-- TRACK -->
     <div id="panel-track" class="panel active">
       <div class="overview-grid">
         <div class="card">
-          <div class="card-title">Efficiency — Track (speed/HR ×1000)</div>
+          <div class="card-title">Économie track — vit/FC ×1000 (tous sessions)</div>
           <div class="chart-wrap"><canvas id="chart-track-trend"></canvas></div>
         </div>
         <div class="card">
-          <div class="card-title">Session Detail — click a session in the sidebar</div>
-          <div id="track-detail">
-            <p class="no-data">Sélectionner une session dans la barre latérale</p>
-          </div>
+          <div class="card-title">Détail session</div>
+          <div id="track-detail"><p class="no-data">← Sélectionner une session</p></div>
         </div>
       </div>
-      <div id="track-ts-card" class="card" style="display:none; margin-bottom:16px">
-        <div class="card-title">Vitesse &amp; FC — <span id="track-ts-title"></span></div>
+      <div id="track-ts-card" class="card" style="display:none">
+        <div class="card-title">Vitesse &amp; fréq. cardiaque — <span id="track-ts-title"></span></div>
         <div class="chart-wrap-tall"><canvas id="chart-track-ts"></canvas></div>
       </div>
       <div id="track-eff-card" class="card" style="display:none">
-        <div class="card-title">Efficacité par bloc</div>
+        <div class="card-title">Économie par bloc (vit. m/s ÷ FC)</div>
         <div class="chart-wrap"><canvas id="chart-track-eff"></canvas></div>
       </div>
     </div>
 
-    <!-- HILLS panel -->
+    <!-- HILLS -->
     <div id="panel-hills" class="panel">
       <div class="overview-grid">
         <div class="card">
-          <div class="card-title">Efficiency — Hills (asc_speed/HR)</div>
+          <div class="card-title">Économie montée — vit.asc/FC (tous sessions)</div>
           <div class="chart-wrap"><canvas id="chart-hills-trend"></canvas></div>
         </div>
         <div class="card">
-          <div class="card-title">Session Detail — click a session in the sidebar</div>
-          <div id="hills-detail">
-            <p class="no-data">Sélectionner une session dans la barre latérale</p>
-          </div>
+          <div class="card-title">Détail session</div>
+          <div id="hills-detail"><p class="no-data">← Sélectionner une session</p></div>
         </div>
       </div>
-      <div id="hills-ts-card" class="card" style="display:none; margin-bottom:16px">
-        <div class="card-title">Asc. speed &amp; FC — <span id="hills-ts-title"></span></div>
+      <div id="hills-ts-card" class="card" style="display:none">
+        <div class="card-title">Profil altimétrique &amp; fréq. cardiaque — <span id="hills-ts-title"></span></div>
         <div class="chart-wrap-tall"><canvas id="chart-hills-ts"></canvas></div>
       </div>
       <div id="hills-eff-card" class="card" style="display:none">
-        <div class="card-title">Efficacité par répétition</div>
+        <div class="card-title">Économie par répétition (vit.ascens. m/h ÷ FC)</div>
         <div class="chart-wrap"><canvas id="chart-hills-eff"></canvas></div>
       </div>
     </div>
 
-    <!-- ZONES panel -->
+    <!-- ZONES -->
     <div id="panel-zones" class="panel">
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-title">Vitesse par zone HR — évolution annuelle (sessions track)</div>
+      <div class="card">
+        <div class="card-title">Vitesse (km/h) par zone FC — évolution annuelle (track)</div>
         <div class="chart-wrap-tall"><canvas id="chart-zones"></canvas></div>
       </div>
       <div class="card">
-        <div class="card-title">Tableau — vitesse médiane (km/h) par zone et par année</div>
+        <div class="card-title">Tableau — vitesse médiane par zone et par année</div>
         <div id="zones-table"></div>
       </div>
     </div>
@@ -512,48 +555,93 @@ def render_html(cache: dict) -> str:
 
 <script>
 // ── embedded data ──────────────────────────────────────────────────────────
-const SESSIONS = {sessions_js};
-const TRACK_TREND = {json.dumps(track_trend)};
-const HILL_TREND  = {json.dumps(hill_trend)};
+const SESSIONS    = {sessions_js};
+const TRACK_TREND = {json.dumps(track_trend, ensure_ascii=False)};
+const HILL_TREND  = {json.dumps(hill_trend,  ensure_ascii=False)};
 const ZONE_YEARS  = {json.dumps(zone_years)};
 const ZONE_SERIES = {json.dumps(zone_series)};
 const ZONE_COLORS = {json.dumps(zone_colors)};
-const ZONE_LABELS = {json.dumps(zone_labels)};
+const ZONE_LABELS = {json.dumps(zone_labels, ensure_ascii=False)};
 
-// ── chart helpers ──────────────────────────────────────────────────────────
-let chartInstances = {{}};
+// ── custom plugin: grey band overlay (work intervals / hill repeats) ───────
+const workBandsPlugin = {{
+  id: 'workBands',
+  beforeDraw(chart) {{
+    const bands = chart.options.plugins?.workBands;
+    if (!bands?.length) return;
+    const {{ctx, chartArea: {{top, bottom, left, right}}, scales: {{x}}}} = chart;
+    const h = bottom - top;
+    ctx.save();
+    bands.forEach((b) => {{
+      const x0 = Math.max(left,  x.getPixelForValue(b.s));
+      const x1 = Math.min(right, x.getPixelForValue(b.e));
+      if (x1 <= x0) return;
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      ctx.fillRect(x0, top, x1 - x0, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0, top, x1 - x0, h);
+      if (b.lbl) {{
+        ctx.fillStyle = 'rgba(180,190,255,0.75)';
+        ctx.font = 'bold 10px system-ui';
+        ctx.fillText(b.lbl, x0 + 3, top + 12);
+      }}
+    }});
+    ctx.restore();
+  }}
+}};
+Chart.register(workBandsPlugin);
 
-function destroyChart(id) {{
-  if (chartInstances[id]) {{ chartInstances[id].destroy(); delete chartInstances[id]; }}
-}}
+// ── chart registry ─────────────────────────────────────────────────────────
+const _charts = {{}};
+function destroyChart(id) {{ if (_charts[id]) {{ _charts[id].destroy(); delete _charts[id]; }} }}
+function mkChart(id, cfg) {{ destroyChart(id); _charts[id] = new Chart(document.getElementById(id), cfg); }}
 
-function mkChart(id, cfg) {{
-  destroyChart(id);
-  chartInstances[id] = new Chart(document.getElementById(id), cfg);
-}}
-
-const darkGrid = {{ color: 'rgba(255,255,255,.06)' }};
+const darkGrid = {{ color: 'rgba(255,255,255,.05)' }};
 const darkTick = {{ color: '#5c6080' }};
 
+// ── helper: ts.t indices for a time in seconds ─────────────────────────────
+function tIdx(sec, tArr) {{
+  let i = tArr.findIndex(t => t >= sec);
+  return i < 0 ? tArr.length - 1 : i;
+}}
+function computeBands(segs, tArr, prefix) {{
+  let workNum = 0;
+  return segs.map(s => {{
+    if (!s.is_work && prefix === 'B') return null;
+    workNum++;
+    return {{
+      s: tIdx(s.start_s, tArr),
+      e: tIdx(s.end_s,   tArr),
+      lbl: prefix + workNum,
+    }};
+  }}).filter(Boolean);
+}}
+function computeHillBands(reps, tArr) {{
+  return reps.map(r => ({{
+    s: tIdx(r.start_s, tArr),
+    e: tIdx(r.end_s,   tArr),
+    lbl: 'R' + r.repeat_num,
+  }}));
+}}
+
 // ── trend charts ───────────────────────────────────────────────────────────
-function buildTrendChart(canvasId, trend, multiplier, yLabel, color) {{
-  const labels = trend.map(d => d.date);
-  const data   = trend.map(d => d.eff ? +(d.eff * multiplier).toFixed(3) : null);
+function buildTrend(canvasId, trend, mult, yLabel, color) {{
   mkChart(canvasId, {{
     type: 'scatter',
     data: {{
       datasets: [{{
         label: yLabel,
-        data: trend.map(d => ({{ x: d.date, y: d.eff ? +(d.eff * multiplier).toFixed(3) : null }})),
-        backgroundColor: color,
-        pointRadius: 5, pointHoverRadius: 7,
+        data: trend.map(d => ({{ x: d.date, y: d.eff ? +(d.eff * mult).toFixed(3) : null }})),
+        backgroundColor: color, pointRadius: 5, pointHoverRadius: 7,
       }}]
     }},
     options: {{
       responsive: true, maintainAspectRatio: false,
-      plugins: {{ legend: {{ display: false }}, tooltip: {{
-        callbacks: {{ label: ctx => `${{ctx.raw.x}}: ${{ctx.raw.y}} (${{trend[ctx.dataIndex]?.n}} blocs)` }}
-      }} }},
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{ callbacks: {{ label: ctx => `${{ctx.raw.x}} — ${{ctx.raw.y}} (${{trend[ctx.dataIndex]?.n}} × | ${{trend[ctx.dataIndex]?.name || ''}})` }} }},
+      }},
       scales: {{
         x: {{ type: 'category', ticks: {{ ...darkTick, maxTicksLimit: 6, maxRotation: 0 }}, grid: darkGrid }},
         y: {{ title: {{ display: true, text: yLabel, color: '#6b7089' }}, ticks: darkTick, grid: darkGrid }},
@@ -561,25 +649,22 @@ function buildTrendChart(canvasId, trend, multiplier, yLabel, color) {{
     }}
   }});
 }}
-
-buildTrendChart('chart-track-trend', TRACK_TREND, 1000, 'speed/HR ×1000', 'rgba(108,122,255,.75)');
-buildTrendChart('chart-hills-trend', HILL_TREND,  1,    'asc_speed/HR',    'rgba(46,204,113,.75)');
+buildTrend('chart-track-trend', TRACK_TREND, 1000, 'vit/FC ×1000', 'rgba(108,122,255,.75)');
+buildTrend('chart-hills-trend', HILL_TREND,  1,    'asc/FC',        'rgba(46,204,113,.75)');
 
 // ── zone speed chart ───────────────────────────────────────────────────────
 (function() {{
-  const zones = ['Z2_aerobic', 'Z3_tempo', 'Z4_threshold'];
-  const ds = zones.map(z => ({{
-    label: ZONE_LABELS[z],
-    data: ZONE_SERIES[z],
-    borderColor: ZONE_COLORS[z],
-    backgroundColor: ZONE_COLORS[z] + '33',
-    tension: .3,
-    fill: false,
-    pointRadius: 4,
-  }}));
+  const z3 = ['Z2_aerobic','Z3_tempo','Z4_threshold'];
   mkChart('chart-zones', {{
     type: 'line',
-    data: {{ labels: ZONE_YEARS.map(String), datasets: ds }},
+    data: {{
+      labels: ZONE_YEARS.map(String),
+      datasets: z3.map(z => ({{
+        label: ZONE_LABELS[z], data: ZONE_SERIES[z],
+        borderColor: ZONE_COLORS[z], backgroundColor: ZONE_COLORS[z]+'33',
+        tension: .3, fill: false, pointRadius: 4,
+      }}))
+    }},
     options: {{
       responsive: true, maintainAspectRatio: false,
       plugins: {{ legend: {{ labels: {{ color: '#cdd0e8', font: {{ size: 12 }} }} }} }},
@@ -587,99 +672,77 @@ buildTrendChart('chart-hills-trend', HILL_TREND,  1,    'asc_speed/HR',    'rgba
         x: {{ ticks: darkTick, grid: darkGrid }},
         y: {{ title: {{ display: true, text: 'Vitesse (km/h)', color: '#6b7089' }},
               ticks: darkTick, grid: darkGrid }},
-      }},
+      }}
     }}
   }});
-
-  // Table
-  const zAll = Object.keys(ZONE_LABELS);
-  let html = '<table><tr><th>Année</th>' + zAll.map(z => `<th>${{ZONE_LABELS[z]}}</th>`).join('') + '</tr>';
+  const allZ = Object.keys(ZONE_LABELS);
+  let html = '<table><tr><th>Année</th>' + allZ.map(z => `<th>${{ZONE_LABELS[z]}}</th>`).join('') + '</tr>';
   ZONE_YEARS.forEach((yr, i) => {{
-    html += `<tr><td>${{yr}}</td>` + zAll.map(z => {{
-      const v = ZONE_SERIES[z]?.[i]; return `<td>${{v != null ? v : '—'}}</td>`;
-    }}).join('') + '</tr>';
+    html += `<tr><td>${{yr}}</td>` + allZ.map(z => `<td>${{ZONE_SERIES[z]?.[i] ?? '—'}}</td>`).join('') + '</tr>';
   }});
-  html += '</table>';
-  document.getElementById('zones-table').innerHTML = html;
+  document.getElementById('zones-table').innerHTML = html + '</table>';
 }})();
 
 // ── session selection ──────────────────────────────────────────────────────
-let activeEl = null;
-
+let _activeEl = null;
 function selectSession(el, type) {{
-  if (activeEl) activeEl.classList.remove('active');
+  if (_activeEl) _activeEl.classList.remove('active');
   el.classList.add('active');
-  activeEl = el;
-  const fname = el.dataset.file;
-  const key   = `${{type}}:${{fname}}`;
-  const data  = SESSIONS[key];
+  _activeEl = el;
+  const data = SESSIONS[type + ':' + el.dataset.file];
   if (!data) return;
-  if (type === 'track') renderTrack(fname, data);
-  else renderHills(fname, data);
+  type === 'track' ? renderTrack(data) : renderHills(data);
 }}
 
 // ── track detail ───────────────────────────────────────────────────────────
-function renderTrack(fname, data) {{
-  const intervals = data.intervals || [];
-  const work = intervals.filter(i => i.is_work);
-  const dur  = data.duration_s ? fmtHms(data.duration_s) : '—';
-  const dist = data.distance_km ? data.distance_km + ' km' : '—';
-  const eff  = data.mean_efficiency ? (data.mean_efficiency * 1000).toFixed(2) : '—';
-
+function renderTrack(data) {{
+  const ivs  = data.intervals || [];
+  const work = ivs.filter(i => i.is_work);
+  const eff  = data.mean_efficiency ? (data.mean_efficiency*1000).toFixed(2) : '—';
+  const lbl  = data.used_laps ? '<span class="laps-badge">laps GPS</span>' : '';
   document.getElementById('track-detail').innerHTML = `
-    <h2 class="sess-heading">${{data.date}}</h2>
-    <div class="sess-subheading">${{dist}} · ${{dur}} · ${{work.length}} blocs de travail</div>
+    ${{data.name ? `<div class="sess-label">${{data.name}}</div>` : ''}}
+    <h2 class="sess-heading">${{data.date}}${{lbl}}</h2>
+    <div class="sess-subheading">${{data.distance_km || '—'}} km · ${{fmtHms(data.duration_s)}} · ${{work.length}} blocs travail</div>
     <div class="stat-row">
-      <div class="stat"><div class="stat-val">${{eff}}</div><div class="stat-lbl">eff ×1000</div></div>
+      <div class="stat"><div class="stat-val">${{eff}}</div><div class="stat-lbl">économie ×1000</div></div>
       <div class="stat"><div class="stat-val">${{work.length}}</div><div class="stat-lbl">blocs</div></div>
-      <div class="stat"><div class="stat-val">${{work.length > 0 ? work[0].speed_kmh.toFixed(1) : '—'}}</div><div class="stat-lbl">moy 1er bloc km/h</div></div>
     </div>
     <table>
-      <tr><th>#</th><th>Durée</th><th>Vitesse km/h</th><th>FC moy</th><th>Efficacité ×1000</th></tr>
-      ${{intervals.filter(i=>i.is_work).map((iv,i) => `
-        <tr class="work-row">
-          <td>${{i+1}}</td><td>${{fmtMin(iv.duration_s)}}</td>
-          <td>${{iv.speed_kmh.toFixed(2)}}</td>
-          <td>${{iv.mean_hr ? iv.mean_hr.toFixed(0) : '—'}}</td>
-          <td><span class="eff-badge" style="background:${{effColor(iv.efficiency, 'track')}}">${{iv.efficiency ? (iv.efficiency*1000).toFixed(2) : '—'}}</span></td>
-        </tr>`).join('')}}
+      <tr><th>#</th><th>Durée</th><th>Vit. km/h</th><th>FC moy (bpm)</th><th>Éco = vit/FC ×1000</th></tr>
+      ${{work.map((iv,i) => `<tr class="work-row">
+        <td>${{i+1}}</td><td>${{fmtMin(iv.duration_s)}}</td><td>${{iv.speed_kmh.toFixed(2)}}</td>
+        <td>${{iv.mean_hr ? iv.mean_hr.toFixed(0) : '—'}}</td>
+        <td><span class="eff-badge" style="background:${{effColor(iv.efficiency,'track')}}">${{iv.efficiency ? (iv.efficiency*1000).toFixed(2) : '—'}}</span></td>
+      </tr>`).join('')}}
     </table>`;
 
-  // Time series
   const ts = data.ts || {{}};
-  if (ts.t && ts.t.length) {{
+  if (ts.t?.length) {{
+    document.getElementById('track-ts-title').textContent = data.name || data.date;
     document.getElementById('track-ts-card').style.display = '';
-    document.getElementById('track-ts-title').textContent = data.date;
-    destroyChart('chart-track-ts');
-    const annots = intervals.filter(i => i.is_work).map(iv => ({{
-      type: 'box', xMin: fmtElapsed(iv.start_s), xMax: fmtElapsed(iv.end_s),
-      backgroundColor: 'rgba(108,122,255,.12)', borderColor: 'transparent',
-    }}));
-    buildTsChart('chart-track-ts', ts, 'Vitesse (km/h)', 'rgba(108,122,255,.8)', intervals);
+    const bands = computeBands(ivs, ts.t, 'B');
+    buildTrackTs('chart-track-ts', ts, bands);
   }} else {{
     document.getElementById('track-ts-card').style.display = 'none';
   }}
 
-  // Efficiency bars
-  const workWithEff = intervals.filter(i => i.is_work && i.efficiency);
-  if (workWithEff.length) {{
+  const workEff = work.filter(i => i.efficiency);
+  if (workEff.length) {{
     document.getElementById('track-eff-card').style.display = '';
     mkChart('chart-track-eff', {{
       type: 'bar',
       data: {{
-        labels: workWithEff.map((_,i) => `Bloc ${{i+1}}`),
-        datasets: [{{
-          label: 'Efficacité ×1000',
-          data: workWithEff.map(iv => +(iv.efficiency * 1000).toFixed(3)),
-          backgroundColor: workWithEff.map(iv => effColor(iv.efficiency, 'track')),
-        }}]
+        labels: workEff.map((_,i) => 'B'+(i+1)),
+        datasets: [{{ label: 'Éco ×1000', data: workEff.map(i => +(i.efficiency*1000).toFixed(3)),
+                      backgroundColor: workEff.map(i => effColor(i.efficiency,'track')), }}]
       }},
       options: {{
         responsive: true, maintainAspectRatio: false,
         plugins: {{ legend: {{ display: false }} }},
         scales: {{
           x: {{ ticks: darkTick, grid: darkGrid }},
-          y: {{ title: {{ display: true, text: 'speed/HR ×1000', color: '#6b7089' }},
+          y: {{ title: {{ display: true, text: 'vit.(m/s) ÷ FC (bpm)', color: '#6b7089' }},
                 ticks: darkTick, grid: darkGrid }},
         }}
       }}
@@ -689,63 +752,56 @@ function renderTrack(fname, data) {{
   }}
 }}
 
-// ── hill detail ────────────────────────────────────────────────────────────
-function renderHills(fname, data) {{
+// ── hills detail ───────────────────────────────────────────────────────────
+function renderHills(data) {{
   const reps = data.repeats || [];
-  const dur  = data.duration_s ? fmtHms(data.duration_s) : '—';
-  const dist = data.distance_km ? data.distance_km + ' km' : '—';
   const eff  = data.mean_efficiency ? data.mean_efficiency.toFixed(2) : '—';
-  const dplus = data.dplus_m ? Math.round(data.dplus_m) + ' m D+' : '—';
-
   document.getElementById('hills-detail').innerHTML = `
+    ${{data.name ? `<div class="sess-label">${{data.name}}</div>` : ''}}
     <h2 class="sess-heading">${{data.date}}</h2>
-    <div class="sess-subheading">${{dist}} · ${{dur}} · ${{dplus}} · ${{reps.length}} répétitions</div>
+    <div class="sess-subheading">${{data.distance_km || '—'}} km · ${{fmtHms(data.duration_s)}} · ${{data.dplus_m ? Math.round(data.dplus_m)+'m D+' : ''}} · ${{reps.length}} reps</div>
     <div class="stat-row">
-      <div class="stat"><div class="stat-val">${{eff}}</div><div class="stat-lbl">eff (asc/FC)</div></div>
-      <div class="stat"><div class="stat-val">${{reps.length}}</div><div class="stat-lbl">reps</div></div>
-      <div class="stat"><div class="stat-val">${{reps.length > 0 ? Math.round(reps[0].dplus_m) : '—'}}</div><div class="stat-lbl">D+ rep1 (m)</div></div>
+      <div class="stat"><div class="stat-val">${{eff}}</div><div class="stat-lbl">éco (asc/FC)</div></div>
+      <div class="stat"><div class="stat-val">${{reps.length}}</div><div class="stat-lbl">répétitions</div></div>
+      <div class="stat"><div class="stat-val">${{reps.length ? Math.round(reps[0].dplus_m) : '—'}}</div><div class="stat-lbl">D+ rep1 (m)</div></div>
     </div>
     <table>
-      <tr><th>#</th><th>Durée</th><th>D+</th><th>Pente %</th><th>Vit. asc</th><th>FC moy</th><th>Efficacité</th></tr>
-      ${{reps.map((r,i) => `
-        <tr class="work-row">
-          <td>${{r.repeat_num}}</td><td>${{fmtMin(r.duration_s)}}</td>
-          <td>${{Math.round(r.dplus_m)}} m</td>
-          <td>${{r.avg_grade_pct.toFixed(1)}}%</td>
-          <td>${{Math.round(r.asc_speed_mh)}} m/h</td>
-          <td>${{r.mean_hr ? r.mean_hr.toFixed(0) : '—'}}</td>
-          <td><span class="eff-badge" style="background:${{effColor(r.efficiency, 'hills')}}">${{r.efficiency ? r.efficiency.toFixed(2) : '—'}}</span></td>
-        </tr>`).join('')}}
+      <tr><th>#</th><th>Durée</th><th>D+</th><th>Pente</th><th>Vit.asc (m/h)</th><th>FC moy (bpm)</th><th>Éco = vit.asc ÷ FC</th></tr>
+      ${{reps.map(r => `<tr class="work-row">
+        <td>R${{r.repeat_num}}</td><td>${{fmtMin(r.duration_s)}}</td>
+        <td>${{Math.round(r.dplus_m)}}m</td><td>${{r.avg_grade_pct.toFixed(1)}}%</td>
+        <td>${{Math.round(r.asc_speed_mh)}}</td>
+        <td>${{r.mean_hr ? r.mean_hr.toFixed(0) : '—'}}</td>
+        <td><span class="eff-badge" style="background:${{effColor(r.efficiency,'hills')}}">${{r.efficiency ? r.efficiency.toFixed(2) : '—'}}</span></td>
+      </tr>`).join('')}}
     </table>`;
 
   const ts = data.ts || {{}};
-  if (ts.t && ts.t.length) {{
+  if (ts.t?.length) {{
+    document.getElementById('hills-ts-title').textContent = data.name || data.date;
     document.getElementById('hills-ts-card').style.display = '';
-    document.getElementById('hills-ts-title').textContent = data.date;
-    buildTsChart('chart-hills-ts', ts, 'FC', 'rgba(46,204,113,.8)', []);
+    const bands = computeHillBands(reps, ts.t);
+    buildHillsTs('chart-hills-ts', ts, bands);
   }} else {{
     document.getElementById('hills-ts-card').style.display = 'none';
   }}
 
-  const repsWithEff = reps.filter(r => r.efficiency);
-  if (repsWithEff.length) {{
+  const repsEff = reps.filter(r => r.efficiency);
+  if (repsEff.length) {{
     document.getElementById('hills-eff-card').style.display = '';
     mkChart('chart-hills-eff', {{
       type: 'bar',
       data: {{
-        labels: repsWithEff.map(r => `Rep ${{r.repeat_num}}`),
-        datasets: [{{
-          label: 'asc_speed / FC',
-          data: repsWithEff.map(r => +r.efficiency.toFixed(3)),
-          backgroundColor: repsWithEff.map(r => effColor(r.efficiency, 'hills')),
-        }}]
+        labels: repsEff.map(r => 'R'+r.repeat_num),
+        datasets: [{{ label: 'vit.asc ÷ FC', data: repsEff.map(r => +r.efficiency.toFixed(3)),
+                      backgroundColor: repsEff.map(r => effColor(r.efficiency,'hills')), }}]
       }},
       options: {{
         responsive: true, maintainAspectRatio: false,
         plugins: {{ legend: {{ display: false }} }},
         scales: {{
           x: {{ ticks: darkTick, grid: darkGrid }},
-          y: {{ title: {{ display: true, text: 'asc_speed/FC', color: '#6b7089' }},
+          y: {{ title: {{ display: true, text: 'vit.ascens.(m/h) ÷ FC (bpm)', color: '#6b7089' }},
                 ticks: darkTick, grid: darkGrid }},
         }}
       }}
@@ -755,97 +811,115 @@ function renderHills(fname, data) {{
   }}
 }}
 
-// ── dual-axis time series chart ────────────────────────────────────────────
-function buildTsChart(canvasId, ts, speedLabel, speedColor, intervals) {{
-  const labels = ts.t.map(s => Math.round(s / 60) + 'min');
-  const maxLabel = Math.ceil(ts.t[ts.t.length-1] / 60);
-
-  // Work interval background via annotation plugin (not available — use dataset approach)
-  const workBands = intervals.filter(i => i && i.is_work).map(iv => ({{
-    start: Math.round(iv.start_s / 60), end: Math.round(iv.end_s / 60)
-  }}));
-
-  mkChart(canvasId, {{
+// ── time series charts ─────────────────────────────────────────────────────
+function buildTrackTs(id, ts, bands) {{
+  const labels = ts.t.map(s => fmtMin(s));
+  mkChart(id, {{
     type: 'line',
     data: {{
       labels,
       datasets: [
-        {{
-          label: speedLabel,
-          data: ts.speed_kmh,
-          yAxisID: 'y',
-          borderColor: speedColor,
-          backgroundColor: 'transparent',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: .2,
-          spanGaps: true,
-        }},
-        {{
-          label: 'FC',
-          data: ts.hr,
-          yAxisID: 'y2',
-          borderColor: 'rgba(231,76,60,.75)',
-          backgroundColor: 'transparent',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: .2,
-          spanGaps: true,
-        }},
+        {{ label: 'Vitesse (km/h)', data: ts.speed_kmh, yAxisID: 'y',
+           borderColor: 'rgba(108,122,255,.85)', backgroundColor: 'transparent',
+           borderWidth: 1.5, pointRadius: 0, tension: .2, spanGaps: true }},
+        {{ label: 'Fréq. cardiaque (bpm)', data: ts.hr, yAxisID: 'y2',
+           borderColor: 'rgba(231,76,60,.75)', backgroundColor: 'transparent',
+           borderWidth: 1.5, pointRadius: 0, tension: .2, spanGaps: true }},
       ]
     }},
     options: {{
       responsive: true, maintainAspectRatio: false,
       interaction: {{ mode: 'index', intersect: false }},
-      plugins: {{ legend: {{ labels: {{ color: '#cdd0e8', font: {{ size: 11 }} }} }} }},
+      plugins: {{
+        legend: {{ labels: {{ color: '#cdd0e8', font: {{ size: 11 }} }} }},
+        workBands: bands,
+      }},
       scales: {{
-        x: {{ ticks: {{ ...darkTick, maxTicksLimit: 8, maxRotation: 0 }}, grid: darkGrid }},
-        y:  {{ position: 'left',  title: {{ display: true, text: speedLabel, color: '#6b7089' }},
+        x:  {{ ticks: {{ ...darkTick, maxTicksLimit: 10, maxRotation: 0 }}, grid: darkGrid }},
+        y:  {{ position: 'left', title: {{ display: true, text: 'Vitesse (km/h)', color: '#6b7089' }},
                ticks: darkTick, grid: darkGrid }},
-        y2: {{ position: 'right', title: {{ display: true, text: 'FC (bpm)', color: '#6b7089' }},
+        y2: {{ position: 'right', title: {{ display: true, text: 'Fréq. cardiaque (bpm)', color: '#6b7089' }},
                ticks: darkTick, grid: {{ drawOnChartArea: false }} }},
-      }}
-    }}
+      }},
+    }},
   }});
 }}
 
-// ── tab switching ──────────────────────────────────────────────────────────
-function switchTab(tab) {{
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  event.target.classList.add('active');
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.getElementById('panel-' + tab).classList.add('active');
-  document.getElementById('sidebar-track').style.display = tab === 'track' ? '' : 'none';
-  document.getElementById('sidebar-hills').style.display = tab === 'hills' ? '' : 'none';
-  const labels = {{ track: `Track Sessions ({len(track_sessions)})`, hills: `Hill Sessions ({len(hill_sessions)})`, zones: 'Zone Speed' }};
-  document.getElementById('sidebar-label').textContent = labels[tab] || '';
+function buildHillsTs(id, ts, bands) {{
+  const labels = ts.t.map(s => fmtMin(s));
+  const hasAlt = ts.alt?.length > 0;
+  const datasets = [];
+  if (hasAlt) {{
+    datasets.push({{ label: 'Altitude (m)', data: ts.alt, yAxisID: 'y',
+      borderColor: 'rgba(46,204,113,.8)', backgroundColor: 'rgba(46,204,113,.08)',
+      borderWidth: 1.5, pointRadius: 0, tension: .15, spanGaps: true, fill: true }});
+  }} else {{
+    datasets.push({{ label: 'Vitesse (km/h)', data: ts.speed_kmh, yAxisID: 'y',
+      borderColor: 'rgba(108,122,255,.85)', backgroundColor: 'transparent',
+      borderWidth: 1.5, pointRadius: 0, tension: .2, spanGaps: true }});
+  }}
+  datasets.push({{ label: 'Fréq. cardiaque (bpm)', data: ts.hr, yAxisID: 'y2',
+    borderColor: 'rgba(231,76,60,.75)', backgroundColor: 'transparent',
+    borderWidth: 1.5, pointRadius: 0, tension: .2, spanGaps: true }});
+
+  mkChart(id, {{
+    type: 'line',
+    data: {{ labels, datasets }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      interaction: {{ mode: 'index', intersect: false }},
+      plugins: {{
+        legend: {{ labels: {{ color: '#cdd0e8', font: {{ size: 11 }} }} }},
+        workBands: bands,
+      }},
+      scales: {{
+        x:  {{ ticks: {{ ...darkTick, maxTicksLimit: 10, maxRotation: 0 }}, grid: darkGrid }},
+        y:  {{ position: 'left',
+               title: {{ display: true, text: hasAlt ? 'Altitude (m)' : 'Vitesse (km/h)', color: '#6b7089' }},
+               ticks: darkTick, grid: darkGrid }},
+        y2: {{ position: 'right',
+               title: {{ display: true, text: 'Fréq. cardiaque (bpm)', color: '#6b7089' }},
+               ticks: darkTick, grid: {{ drawOnChartArea: false }} }},
+      }},
+    }},
+  }});
 }}
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── tab switch ─────────────────────────────────────────────────────────────
+function switchTab(tab, ev) {{
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  ev.target.classList.add('active');
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-'+tab).classList.add('active');
+  document.getElementById('sidebar-track').style.display = tab === 'track' ? '' : 'none';
+  document.getElementById('sidebar-hills').style.display = tab === 'hills' ? '' : 'none';
+  document.getElementById('sidebar-label').textContent = {{
+    track: 'Track ({len(track_sessions)})',
+    hills: 'Hills ({len(hill_sessions)})',
+    zones: 'Zone Speed',
+  }}[tab] || '';
+}}
+
+// ── formatting helpers ─────────────────────────────────────────────────────
 function fmtMin(s) {{
-  const m = Math.floor(s / 60), sec = Math.round(s % 60);
+  const m = Math.floor(s/60), sec = Math.round(s%60);
   return `${{m}}:${{String(sec).padStart(2,'0')}}`;
 }}
 function fmtHms(s) {{
+  if (!s) return '—';
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
   return h ? `${{h}}h${{String(m).padStart(2,'0')}}` : `${{m}}min`;
 }}
-function fmtElapsed(s) {{
-  return Math.round(s/60) + 'min';
-}}
 
-// Colour an efficiency value relative to all sessions
-const trackEffs = TRACK_TREND.map(d => d.eff * 1000).filter(Boolean).sort((a,b)=>a-b);
-const hillEffs  = HILL_TREND.map(d => d.eff).filter(Boolean).sort((a,b)=>a-b);
-
+// ── efficiency colour (percentile-based, red/yellow/green) ─────────────────
+const _trkEffs = TRACK_TREND.map(d => d.eff*1000).filter(Boolean).sort((a,b)=>a-b);
+const _hlsEffs = HILL_TREND.map(d => d.eff).filter(Boolean).sort((a,b)=>a-b);
 function effColor(eff, type) {{
   if (!eff) return '#3d4263';
-  const arr = type === 'track' ? trackEffs : hillEffs;
-  const v = type === 'track' ? eff * 1000 : eff;
-  const p = arr.filter(x => x <= v).length / arr.length;
-  if (p >= .8) return 'rgba(46,204,113,.55)';
-  if (p >= .5) return 'rgba(253,203,110,.55)';
-  return 'rgba(214,63,49,.45)';
+  const arr = type==='track' ? _trkEffs : _hlsEffs;
+  const v   = type==='track' ? eff*1000 : eff;
+  const p   = arr.filter(x => x <= v).length / arr.length;
+  return p>=.8 ? 'rgba(46,204,113,.5)' : p>=.5 ? 'rgba(253,203,110,.5)' : 'rgba(214,63,49,.4)';
 }}
 </script>
 </body>
@@ -859,26 +933,20 @@ function effColor(eff, type) {{
 def main():
     t0 = time.perf_counter()
     import argparse
-    parser = argparse.ArgumentParser(description="Generate efficiency_report.html")
-    parser.add_argument("--rebuild-cache", action="store_true",
-                        help="Ignore cache and re-parse all sessions")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Generate efficiency_report.html")
+    p.add_argument("--rebuild-cache", action="store_true",
+                   help="Re-parse all sessions (needed after parameter or format changes)")
+    args = p.parse_args()
 
     cache = build_cache(rebuild=args.rebuild_cache)
 
-    # Filter to sessions with actual results
-    track_ok = {k: v for k, v in cache["track"].items()
-                if not v.get("no_intervals") and v.get("intervals")}
-    hill_ok  = {k: v for k, v in cache["hills"].items()
-                if not v.get("no_repeats") and v.get("repeats")}
-
-    print(f"\nSessions with intervals: track={len(track_ok)}, hills={len(hill_ok)}")
+    n_trk = sum(1 for d in cache["track"].values() if not d.get("no_intervals") and d.get("intervals"))
+    n_hls = sum(1 for d in cache["hills"].values() if not d.get("no_repeats") and d.get("repeats"))
+    print(f"\nSessions with results: track={n_trk}, hills={n_hls}")
 
     html = render_html(cache)
     OUT_HTML.write_text(html, encoding="utf-8")
-
-    t1 = time.perf_counter()
-    print(f"Written: {OUT_HTML}  ({len(html)//1024} KB)  [{t1-t0:.1f}s]")
+    print(f"Written: {OUT_HTML}  ({len(html)//1024} KB)  [{time.perf_counter()-t0:.1f}s]")
 
 
 if __name__ == "__main__":
