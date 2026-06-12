@@ -96,8 +96,51 @@ def fit_metadata(path: str | Path) -> dict:
         meta["manufacturer"] = d.get("manufacturer")
         meta["product"] = d.get("product")
         break
+    for msg in fitfile.get_messages("workout"):
+        d = {f.name: f.value for f in msg.fields if f.value is not None}
+        meta["workout_name"] = d.get("wkt_name") or None
+        break
 
     return meta
+
+
+def parse_fit_laps(path: str | Path) -> pd.DataFrame:
+    """
+    Return one row per lap message from a FIT file.
+
+    Useful for track sessions where the watch records each interval/recovery
+    as a distinct lap with an intensity label (active / warmup / rest / cooldown).
+    Distances are in metres, speeds derived from distance ÷ elapsed time.
+    """
+    _require_fitparse()
+    path = Path(path)
+    fitfile = fitparse.FitFile(
+        str(path), data_processor=fitparse.StandardUnitsDataProcessor()
+    )
+
+    t0 = None
+    rows: list[dict] = []
+    for msg in fitfile.get_messages("lap"):
+        d = {f.name: f.value for f in msg.fields if f.value is not None}
+        start_t = d.get("start_time")
+        if t0 is None and start_t:
+            t0 = start_t
+        start_s = (start_t - t0).total_seconds() if (start_t and t0) else 0.0
+        dur = float(d.get("total_elapsed_time") or 0)
+        dist = float(d.get("total_distance") or 0)  # metres (no unit conversion needed)
+        # avg_speed from Garmin is often 0 for track laps; compute from dist/time
+        speed_ms = dist / dur if dur > 1 else 0.0
+        rows.append({
+            "start_s":    round(start_s, 1),
+            "duration_s": round(dur, 1),
+            "end_s":      round(start_s + dur, 1),
+            "distance_m": round(dist, 1),
+            "avg_speed_ms": round(speed_ms, 3),
+            "avg_hr":     d.get("avg_heart_rate"),
+            "intensity":  str(d.get("intensity") or "").lower(),
+            "trigger":    str(d.get("lap_trigger") or "").lower(),
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------

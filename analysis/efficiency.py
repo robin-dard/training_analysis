@@ -72,6 +72,37 @@ class HillRepeat:
 # Track interval detection
 # ---------------------------------------------------------------------------
 
+def detect_track_intervals_from_laps(laps_df: "pd.DataFrame") -> list[Interval]:
+    """
+    Build Interval list directly from FIT lap messages (more accurate than speed threshold).
+
+    Intensity "active" → work.  "warmup" / "cooldown" / numeric rest values → not work.
+    Speed is computed from total_distance / elapsed_time because Garmin often stores
+    avg_speed = 0 in lap messages for track running.
+    """
+    if laps_df is None or laps_df.empty:
+        return []
+
+    intervals: list[Interval] = []
+    for _, lap in laps_df.iterrows():
+        intensity = str(lap.get("intensity", "")).lower()
+        is_work = intensity == "active"
+        dur = float(lap.get("duration_s") or 0)
+        if dur < 5:
+            continue
+        start_s = float(lap.get("start_s") or 0)
+        speed_ms = float(lap.get("avg_speed_ms") or 0)
+        hr = lap.get("avg_hr")
+        intervals.append(Interval(
+            start_s=start_s,
+            end_s=float(lap.get("end_s") or start_s + dur),
+            is_work=is_work,
+            mean_speed_ms=round(speed_ms, 3),
+            mean_hr=round(float(hr), 1) if hr else None,
+        ))
+    return intervals
+
+
 def detect_track_intervals(
     df: pd.DataFrame,
     speed_quantile: float = 0.58,
