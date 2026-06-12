@@ -19,8 +19,9 @@ from pathlib import Path
 
 from parsers.strava_client import StravaClient
 
-RACES_FILE = Path("data/races/races.json")
-FIT_DIR    = Path("data/fit")
+_ROOT      = Path(__file__).resolve().parent.parent
+RACES_FILE = _ROOT / "data/races/races.json"
+FIT_DIR    = _ROOT / "data/fit"
 
 
 def _load_registry() -> list[dict]:

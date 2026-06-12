@@ -14,7 +14,8 @@ from typing import Optional
 
 import pandas as pd
 
-SUMMARIES_FILE = Path("data/summaries.parquet")
+_ROOT          = Path(__file__).resolve().parent.parent
+SUMMARIES_FILE = _ROOT / "data/summaries.parquet"
 
 # Sport classification — covers both Garmin typeKeys and Strava sport_type
 _TRAIL = {

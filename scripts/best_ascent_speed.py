@@ -25,15 +25,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from analysis.build_taper_pattern import _classify, load_summaries
 from parsers.fit_parser import parse_fit_file
 
-CACHE_FILE   = Path("data/best_ascent_cache.json")
-STREAMS_DIR  = Path("data/strava_streams")
-FIT_DIR      = Path("data/fit")
+CACHE_FILE   = _ROOT / "data/best_ascent_cache.json"
+STREAMS_DIR  = _ROOT / "data/strava_streams"
+FIT_DIR      = _ROOT / "data/fit"
 WINDOWS      = {"10'": 600, "20'": 1200, "60'": 3600}
 
 # Only analyse activities likely to have real climbs
@@ -250,7 +251,7 @@ def run(top_n: int = 3, rebuild: bool = False, skip_years: list[int] | None = No
     print()
 
 
-HTML_OUT = Path("data/best_ascent_report.html")
+HTML_OUT = _ROOT / "data/best_ascent_report.html"
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">

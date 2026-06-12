@@ -21,14 +21,15 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
 
 from analysis.build_taper_pattern import (
     avg_build, avg_taper, compute_race_window, load_summaries,
 )
 
-RACES_FILE = Path("data/races/races.json")
-OUT_FILE   = Path("data/race_report.html")
+RACES_FILE = _ROOT / "data/races/races.json"
+OUT_FILE   = _ROOT / "data/race_report.html"
 TODAY      = date.today()
 
 
@@ -68,10 +69,10 @@ def _last_hard_day(taper_list, km_thresh: float = 15.0, h_thresh: float = 2.0) -
     return None
 
 
-def _window_to_dict(w, is_good: bool,
-                    is_upcoming: bool = False, plan: dict | None = None) -> dict:
+def _window_to_dict(w, is_good: bool, is_upcoming: bool = False) -> dict:
     lhd = _last_hard_day(w.taper)
     peak_wk = max(w.build, key=lambda ws: ws.total_h, default=None)
+    today_offset = (TODAY - w.race_date).days if is_upcoming else None
     return {
         "name":          w.race_name,
         "date":          str(w.race_date),
@@ -80,7 +81,7 @@ def _window_to_dict(w, is_good: bool,
         "dplus_m":       w.dplus_m,
         "is_good":       is_good,
         "is_upcoming":   is_upcoming,
-        "plan":          plan,
+        "today_offset":  today_offset,
         "last_hard":     lhd,
         "peak_week":     peak_wk.week_offset if peak_wk else None,
         "peak_total_h":  round(peak_wk.total_h, 1) if peak_wk else 0,
@@ -331,22 +332,9 @@ function trailBuildChart(id, race, avgData){
   const lbl=race.build.map(w=>'W'+w.week);
   const acc=race.is_upcoming?'rgba(217,119,6,.8)':race.is_good?'rgba(22,163,74,.75)':'rgba(220,38,38,.7)';
 
-  // For upcoming races: replace W-2/W-1 bars with plan data if plan exists
-  const trailH=race.build.map(w=>{
-    if(race.is_upcoming&&race.plan&&race.plan.weeks&&race.plan.weeks[String(w.week)])
-      return race.plan.weeks[String(w.week)].trail_h;
-    return w.trail_h;
-  });
-  const trailDp=race.build.map(w=>{
-    if(race.is_upcoming&&race.plan&&race.plan.weeks&&race.plan.weeks[String(w.week)])
-      return race.plan.weeks[String(w.week)].trail_dplus;
-    return w.trail_dplus;
-  });
-  const barColors=race.build.map(w=>{
-    if(race.is_upcoming&&race.plan&&race.plan.weeks&&race.plan.weeks[String(w.week)])
-      return 'rgba(217,119,6,.4)';
-    return acc;
-  });
+  const trailH=race.build.map(w=>w.trail_h);
+  const trailDp=race.build.map(w=>w.trail_dplus);
+  const barColors=race.build.map(()=>acc);
 
   _ch[id]=new Chart(ctx,{type:'bar',
     data:{labels:lbl,datasets:[
@@ -377,16 +365,8 @@ function bikeBuildChart(id, race, avgData){
   const ctx=document.getElementById(id).getContext('2d');
   const lbl=race.build.map(w=>'W'+w.week);
 
-  const bikeH=race.build.map(w=>{
-    if(race.is_upcoming&&race.plan&&race.plan.weeks&&race.plan.weeks[String(w.week)])
-      return race.plan.weeks[String(w.week)].bike_h;
-    return w.bike_h;
-  });
-  const barColors=race.build.map(w=>{
-    if(race.is_upcoming&&race.plan&&race.plan.weeks&&race.plan.weeks[String(w.week)])
-      return 'rgba(59,130,246,.35)';
-    return 'rgba(59,130,246,.65)';
-  });
+  const bikeH=race.build.map(w=>w.bike_h);
+  const barColors=race.build.map(()=>'rgba(59,130,246,.65)');
 
   _ch[id]=new Chart(ctx,{type:'bar',
     data:{labels:lbl,datasets:[
@@ -411,22 +391,44 @@ function taperChart(id, race, avgData){
   _kill(id);
   const ctx=document.getElementById(id).getContext('2d');
   const lhd=race.last_hard;
+  const todayOff = race.today_offset ?? null;  // e.g. -8 (days from today to race)
 
-  // For upcoming: inject planned sessions from plan.key_sessions
-  const planSessions={};
-  if(race.is_upcoming&&race.plan&&race.plan.key_sessions){
-    race.plan.key_sessions.forEach(s=>{ planSessions[s.day]={km:s.trail_km,label:s.label}; });
-  }
+  // Past days (done) vs future days
+  const isDone = d => todayOff !== null && d.day <= todayOff;
 
   const trailColors=race.taper.map(d=>{
-    if(planSessions[d.day]) return 'rgba(217,119,6,.85)';
+    if(isDone(d))   return d.day===lhd?'rgba(239,68,68,.85)':'rgba(22,163,74,.75)';
     if(d.day===lhd) return 'rgba(239,68,68,.85)';
-    return race.is_upcoming?'rgba(148,163,184,.5)':race.is_good?'rgba(22,163,74,.7)':'rgba(220,38,38,.65)';
+    return race.is_upcoming?'rgba(148,163,184,.4)':race.is_good?'rgba(22,163,74,.7)':'rgba(220,38,38,.65)';
   });
-  const trailData=race.taper.map(d=>{
-    if(race.is_upcoming&&planSessions[d.day]) return planSessions[d.day].km;
-    return d.trail_km;
-  });
+  const trailData=race.taper.map(d=>d.trail_km);
+
+  // Week boundary lines at D-14 (W-2 start) and D-7 (W-1 start)
+  const weekBoundaryPlugin = {
+    id:'weekBoundary',
+    afterDraw(chart){
+      const {ctx, scales:{x, y}} = chart;
+      const labels = race.taper.map(d=>d.day);
+      [-14, -7].forEach(boundary=>{
+        const idx = labels.indexOf(boundary);
+        if(idx < 0) return;
+        const xPos = x.getPixelForValue(idx) - (x.getPixelForValue(1) - x.getPixelForValue(0)) / 2;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(xPos, y.top);
+        ctx.lineTo(xPos, y.bottom);
+        ctx.strokeStyle = 'rgba(100,100,100,.4)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4,3]);
+        ctx.stroke();
+        const label = boundary===-14?'W-2':'W-1';
+        ctx.fillStyle='rgba(100,100,100,.6)';
+        ctx.font='bold 9px sans-serif';
+        ctx.fillText(label, xPos+3, y.top+10);
+        ctx.restore();
+      });
+    }
+  };
 
   _ch[id]=new Chart(ctx,{type:'bar',
     data:{labels:race.taper.map(d=>'D'+d.day),datasets:[
@@ -436,12 +438,12 @@ function taperChart(id, race, avgData){
        borderColor:'rgba(148,163,184,.7)',borderDash:[3,3],borderWidth:1.5,
        pointRadius:0,fill:false,tension:.3},
     ]},
+    plugins:[weekBoundaryPlugin],
     options:{responsive:true,maintainAspectRatio:false,
       plugins:{legend:{labels:{font:{size:10},boxWidth:10}},
         tooltip:{callbacks:{title:ttips=>{
           const d=race.taper[ttips[0].dataIndex];
-          const ps=planSessions[d.day];
-          if(ps) return `Day ${d.day} — PLANNED: ${ps.label}`;
+          if(isDone(d)) return `Day ${d.day} — DONE (D+ ${d.trail_dplus}m)`;
           return `Day ${d.day}  (D+ ${d.trail_dplus}m)`;
         }}}},
       scales:{
@@ -451,48 +453,6 @@ function taperChart(id, race, avgData){
   });
 }
 
-/* Taper plan comparison card HTML for upcoming races */
-function planCardHTML(race, goodAvg){
-  if(!race.plan||!race.plan.weeks) return '';
-  const pw=race.plan.weeks;
-  const rows=['-2','-1'].map(k=>{
-    const p=pw[k];if(!p)return '';
-    const wk=parseInt(k);
-    const ref=goodAvg.find(w=>w.week===wk);
-    if(!ref) return '';
-    const dtPct=(v,r)=>r>0?Math.round((v-r)/r*100):0;
-    const pClass=(pct)=>Math.abs(pct)<=20?'plan-ok':'plan-warn';
-    const tPct=dtPct(p.trail_h,ref.trail_h);
-    const dPct=dtPct(p.trail_dplus,ref.trail_dplus);
-    const bPct=dtPct(p.bike_h,ref.bike_h);
-    return `<tr>
-      <td><strong>W${k}</strong></td>
-      <td class="${pClass(tPct)}">${p.trail_km}km / ${p.trail_dplus}m D+ / ${p.trail_h}h
-        <small>(${tPct>0?'+':''}${tPct}% vs ref trail h)</small></td>
-      <td>${ref.trail_km}km / ${ref.trail_dplus}m D+ / ${ref.trail_h}h</td>
-      <td class="${pClass(dPct)}">${dPct>0?'+':''}${dPct}%</td>
-      <td class="${pClass(bPct)}">${p.bike_km}km bike / ${p.bike_h}h
-        <small>(${bPct>0?'+':''}${bPct}% vs ref)</small></td>
-      <td>${ref.bike_km}km / ${ref.bike_h}h</td>
-    </tr>`;
-  }).join('');
-
-  const sessions=(race.plan.key_sessions||[]).map(s=>
-    `<span class="session-badge">D${s.day}: ${s.label}</span>`
-  ).join('');
-
-  return `<div class="plan-card">
-    <h3>&#9654; UTHG Taper Plan vs Good-Race Reference</h3>
-    <table class="plan-table">
-      <thead><tr>
-        <th>Week</th><th>Your Plan (trail)</th><th>Good Avg (trail ref)</th><th>D+ delta</th>
-        <th>Your Plan (bike)</th><th>Good Avg (bike ref)</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-    <div class="sessions-row"><strong>Key sessions:</strong> ${sessions}</div>
-  </div>`;
-}
 
 /* ── Views ── */
 let _sortCol=9,_sortDir=1;
@@ -586,7 +546,6 @@ function showRace(idx){
                              :(lhd!=null?`Last hard day: D${lhd}`:'No hard day in 21 days');
   const lhdCls=lhd==null?'ok':lhd<=-14?'good':lhd>=-8?'bad':'ok';
   const scoreDisp=r.score!=null?`${r.score}/4`:'UPCOMING';
-  const planNote=r.is_upcoming?'<p class="chart-note" style="color:#d97706"><strong>Lighter bars = planned (W-2/W-1)</strong></p>':'';
 
   document.getElementById('view').innerHTML=`
     <div class="card">
@@ -608,11 +567,10 @@ function showRace(idx){
         </div>
       </div>
     </div>
-    ${r.is_upcoming?planCardHTML(r,DATA.good_build_avg):''}
     <div class="card">
       <h3>Build — Trail (8 weeks)</h3>
       <div class="cwrap"><canvas id="rc-trail"></canvas></div>
-      <p class="chart-note">Bars = trail hours &nbsp;|&nbsp; Dashed = group avg &nbsp;|&nbsp; Yellow line = D+ (m, right axis)${r.is_upcoming?' &nbsp;|&nbsp; <strong style="color:#d97706">Light bars = planned W-2/W-1</strong>':''}</p>
+      <p class="chart-note">Bars = trail hours &nbsp;|&nbsp; Dashed = group avg &nbsp;|&nbsp; Yellow line = D+ (m, right axis)</p>
     </div>
     <div style="margin-bottom:12px">
       <button id="bike-btn" onclick="toggleBike()"
@@ -624,13 +582,13 @@ function showRace(idx){
       <div class="card" style="margin-bottom:12px">
         <h3>Build — Bike (8 weeks)</h3>
         <div class="cwrap"><canvas id="rc-bike"></canvas></div>
-        <p class="chart-note">Bars = bike hours &nbsp;|&nbsp; Dashed = group avg${r.is_upcoming?' &nbsp;|&nbsp; <strong style="color:#d97706">Light bars = planned W-2/W-1</strong>':''}</p>
+        <p class="chart-note">Bars = bike hours &nbsp;|&nbsp; Dashed = group avg</p>
       </div>
     </div>
     <div class="card">
       <h3>Taper — 21 days before race</h3>
       <div class="cwrap" style="height:220px"><canvas id="rc-t"></canvas></div>
-      <p class="chart-note">${r.is_upcoming?'Orange bars = planned sessions &nbsp;|&nbsp;':'Red bar = last hard day (D'+(lhd??'–')+') &nbsp;|&nbsp;'} Dashed = group avg trail km</p>
+      <p class="chart-note">Red bar = last hard day (D${lhd??'–'}) &nbsp;|&nbsp; Green = done &nbsp;|&nbsp; Dashed = group avg trail km</p>
     </div>`;
 
   _curRace=r; _curAvg=avg;
@@ -693,8 +651,8 @@ def main() -> None:
         "races": (
             [_window_to_dict(w, True)  for w in good_windows] +
             [_window_to_dict(w, False) for w in bad_windows]  +
-            [_window_to_dict(w, True, is_upcoming=True, plan=r.get("taper_plan"))
-             for w, r in zip(upcoming_windows, upcoming_races)]
+            [_window_to_dict(w, True, is_upcoming=True)
+             for w in upcoming_windows]
         ),
     }
 

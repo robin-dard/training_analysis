@@ -20,14 +20,15 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
 sys.stdout.reconfigure(encoding="utf-8")
 
 from analysis.build_taper_pattern import (
     avg_build, avg_taper, compute_race_window, load_summaries,
 )
 
-RACES_FILE = Path("data/races/races.json")
+RACES_FILE = _ROOT / "data/races/races.json"
 TODAY = date.today()
 
 # ─────────────────────────────────────────────────────────────────────────────

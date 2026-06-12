@@ -22,7 +22,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_TOKEN_CACHE = Path(".strava_token_cache.json")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_TOKEN_CACHE  = _PROJECT_ROOT / ".strava_token_cache.json"
 _BASE = "https://www.strava.com/api/v3"
 _AUTH = "https://www.strava.com/oauth/token"
 

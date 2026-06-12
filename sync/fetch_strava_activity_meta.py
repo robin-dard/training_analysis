@@ -22,8 +22,9 @@ from pathlib import Path
 
 from parsers.strava_client import StravaClient
 
-STATE_FILE   = Path(".strava_streams_state.json")
-META_FILE    = Path("data/strava_streams/metadata.json")
+_ROOT        = Path(__file__).resolve().parent.parent
+STATE_FILE   = _ROOT / ".strava_streams_state.json"
+META_FILE    = _ROOT / "data/strava_streams/metadata.json"
 
 _SLEEP = 0.5
 

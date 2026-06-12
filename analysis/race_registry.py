@@ -29,9 +29,10 @@ from typing import Optional
 
 import pandas as pd
 
-RACES_FILE   = Path("data/races/races.json")
-FIT_DIR      = Path("data/fit")
-STREAMS_DIR  = Path("data/strava_streams")
+_ROOT        = Path(__file__).resolve().parent.parent
+RACES_FILE   = _ROOT / "data/races/races.json"
+FIT_DIR      = _ROOT / "data/fit"
+STREAMS_DIR  = _ROOT / "data/strava_streams"
 
 
 class RaceRegistry:

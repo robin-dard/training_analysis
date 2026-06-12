@@ -15,6 +15,7 @@ dependencies = [
     "garminconnect>=0.2",
     "garmin-fit-sdk>=21.133",
     "pyarrow>=14.0",
+    "tqdm>=4.0",
 ]
 
 [project.optional-dependencies]

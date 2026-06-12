@@ -18,14 +18,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
+from tqdm import tqdm
 
 from parsers.fit_parser import fit_metadata
 
 _WORKERS = max(1, (os.cpu_count() or 4) - 1)
+_ROOT    = Path(__file__).resolve().parent.parent
 
-FIT_DIR      = Path("data/fit")
-STREAMS_DIR  = Path("data/strava_streams")
-OUT_FILE     = Path("data/summaries.parquet")
+FIT_DIR      = _ROOT / "data/fit"
+STREAMS_DIR  = _ROOT / "data/strava_streams"
+OUT_FILE     = _ROOT / "data/summaries.parquet"
 
 # Map Garmin FIT sport enum to readable string
 _SPORT_MAP = {
@@ -63,33 +65,35 @@ def _parse_one(f: Path) -> dict | None:
         return None
 
 
-def _garmin_rows() -> list[dict]:
-    files = sorted(FIT_DIR.glob("*.fit"))
-    print(f"Parsing {len(files)} FIT files ({_WORKERS} workers) ...")
+def _garmin_rows(known_files: set[str]) -> list[dict]:
+    all_files = sorted(FIT_DIR.glob("*.fit"))
+    new_files = [f for f in all_files if f.name not in known_files]
 
-    rows, done = [], 0
+    if not new_files:
+        print("FIT files: 0 new files.")
+        return []
+
+    rows = []
     with ProcessPoolExecutor(max_workers=_WORKERS) as pool:
-        futures = {pool.submit(_parse_one, f): f for f in files}
-        for fut in as_completed(futures):
-            done += 1
-            if done % 200 == 0:
-                print(f"  {done}/{len(files)}")
-            result = fut.result()
-            if result:
-                rows.append(result)
-
+        futures = {pool.submit(_parse_one, f): f for f in new_files}
+        with tqdm(as_completed(futures), total=len(new_files), desc=f"FIT files (+{len(new_files)} new)", unit="file") as bar:
+            for fut in bar:
+                result = fut.result()
+                if result:
+                    rows.append(result)
     return rows
 
 
-def _strava_rows() -> list[dict]:
-    files = sorted(STREAMS_DIR.glob("*.parquet"))
+def _strava_rows(known_files: set[str]) -> list[dict]:
+    all_files = sorted(STREAMS_DIR.glob("*.parquet"))
+    files = [f for f in all_files if f.name not in known_files]
     if not files:
+        print("Strava streams: 0 new files.")
         return []
 
-    print(f"Aggregating {len(files)} Strava stream files ...")
     rows = []
 
-    for f in files:
+    for f in tqdm(files, desc=f"Strava streams (+{len(files)} new)", unit="file"):
         try:
             df = pd.read_parquet(f)
             if df.empty:
@@ -127,12 +131,12 @@ def _enrich_strava(rows: list[dict]) -> list[dict]:
 
     # Primary: metadata.json with date + sport for all downloaded activities
     meta: dict = {}
-    meta_file = Path("data/strava_streams/metadata.json")
+    meta_file = _ROOT / "data/strava_streams/metadata.json"
     if meta_file.exists():
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
 
     # Fallback: races.json (covers races even without metadata.json)
-    races_file = Path("data/races/races.json")
+    races_file = _ROOT / "data/races/races.json"
     stream_to_race: dict = {}
     if races_file.exists():
         races = json.loads(races_file.read_text(encoding="utf-8"))
@@ -157,26 +161,52 @@ def _enrich_strava(rows: list[dict]) -> list[dict]:
     return rows
 
 
-def build() -> None:
-    garmin = _garmin_rows()
-    strava = _strava_rows()
+def build(rebuild: bool = False) -> None:
+    import time
+    t0 = time.perf_counter()
+
+    existing = pd.DataFrame()
+    known_files: set[str] = set()
+    if not rebuild and OUT_FILE.exists():
+        existing = pd.read_parquet(OUT_FILE)
+        known_files = set(existing["file"].dropna())
+        print(f"Existing parquet: {len(existing)} activities — checking for new files...")
+
+    garmin = _garmin_rows(known_files)
+    t1 = time.perf_counter()
+
+    strava = _strava_rows(known_files)
     strava = _enrich_strava(strava)
+    t2 = time.perf_counter()
 
-    all_rows = garmin + strava
-    df = pd.DataFrame(all_rows)
+    new_rows = garmin + strava
+    if not new_rows and not existing.empty:
+        print("Nothing new — parquet is up to date.")
+        return
 
+    new_df = pd.DataFrame(new_rows)
+    df = pd.concat([existing, new_df], ignore_index=True) if not existing.empty else new_df
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.sort_values("date").reset_index(drop=True)
-
     df.to_parquet(OUT_FILE, index=False)
-    print(f"\nSaved {len(df)} activities to {OUT_FILE}")
-    print(f"  Garmin : {len(garmin)}")
-    print(f"  Strava : {len(strava)}")
-    print(f"  Date range: {df['date'].min().date()} → {df['date'].max().date()}")
+    t3 = time.perf_counter()
+
+    print(f"\nSaved {len(df)} activities to {OUT_FILE} (+{len(new_rows)} new)")
+    print(f"  Garmin new : {len(garmin)}")
+    print(f"  Strava new : {len(strava)}")
+    print(f"  Date range : {df['date'].min().date()} → {df['date'].max().date()}")
+    print(f"\nTimings:")
+    print(f"  FIT parsing : {t1 - t0:.1f}s")
+    print(f"  Strava      : {t2 - t1:.1f}s")
+    print(f"  Write       : {t3 - t2:.1f}s")
+    print(f"  Total       : {t3 - t0:.1f}s")
 
 
 if __name__ == "__main__":
-    # Required on Windows for ProcessPoolExecutor
+    import argparse
     from multiprocessing import freeze_support
     freeze_support()
-    build()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rebuild", action="store_true", help="Ignore existing parquet and rebuild from scratch")
+    args = parser.parse_args()
+    build(rebuild=args.rebuild)

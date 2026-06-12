@@ -26,9 +26,10 @@ import pandas as pd
 
 from parsers.strava_client import StravaClient
 
-STREAMS_DIR  = Path("data/strava_streams")
-STATE_FILE   = Path(".strava_streams_state.json")
-META_FILE    = Path("data/strava_streams/metadata.json")
+_ROOT        = Path(__file__).resolve().parent.parent
+STREAMS_DIR  = _ROOT / "data/strava_streams"
+STATE_FILE   = _ROOT / ".strava_streams_state.json"
+META_FILE    = _ROOT / "data/strava_streams/metadata.json"
 
 STREAMS_DIR.mkdir(parents=True, exist_ok=True)
 

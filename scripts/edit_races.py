@@ -16,7 +16,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-RACES_FILE = Path("data/races/races.json")
+_ROOT      = Path(__file__).resolve().parent.parent
+RACES_FILE = _ROOT / "data/races/races.json"
 TYPES      = ("objective", "preparatory", "red_flag")
 
 

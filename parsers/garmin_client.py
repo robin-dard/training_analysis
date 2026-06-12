@@ -35,8 +35,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_STATE_FILE = Path(".garmin_state.json")
-_FIT_DIR    = Path("data/fit")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_STATE_FILE   = _PROJECT_ROOT / ".garmin_state.json"
+_FIT_DIR      = _PROJECT_ROOT / "data/fit"
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +152,7 @@ class GarminClient:
         sport       = activity.get("activityType", {}).get("typeKey", "unknown")
         filepath    = self._fit_dir / f"{date_str}_{sport}_{activity_id}.fit"
 
-        if filepath.exists():
+        if filepath.exists() and filepath.stat().st_size > 0:
             return filepath
 
         try:
