@@ -76,27 +76,26 @@ def fit_metadata(path: str | Path) -> dict:
     meta: dict = {"path": str(path)}
 
     fitfile = fitparse.FitFile(str(path))
-    for msg in fitfile.get_messages():
-        name = msg.name
-        if name == "session":
-            d = {f.name: f.value for f in msg.fields if f.value is not None}
-            meta.update({
-                "sport": d.get("sport"),
-                "sub_sport": d.get("sub_sport"),
-                "start_time": d.get("start_time"),
-                "total_elapsed_time_s": d.get("total_elapsed_time"),
-                "total_distance_m": d.get("total_distance"),
-                "total_ascent_m": d.get("total_ascent"),
-                "total_descent_m": d.get("total_descent"),
-                "avg_heart_rate": d.get("avg_heart_rate"),
-                "max_heart_rate": d.get("max_heart_rate"),
-                "avg_speed_ms": d.get("avg_speed"),
-                "total_calories": d.get("total_calories"),
-            })
-        elif name == "device_info" and "manufacturer" not in meta:
-            d = {f.name: f.value for f in msg.fields if f.value is not None}
-            meta["manufacturer"] = d.get("manufacturer")
-            meta["product"] = d.get("product")
+    for msg in fitfile.get_messages("session"):
+        d = {f.name: f.value for f in msg.fields if f.value is not None}
+        meta.update({
+            "sport": d.get("sport"),
+            "sub_sport": d.get("sub_sport"),
+            "start_time": d.get("start_time"),
+            "total_elapsed_time_s": d.get("total_elapsed_time"),
+            "total_distance_m": d.get("total_distance"),
+            "total_ascent_m": d.get("total_ascent"),
+            "total_descent_m": d.get("total_descent"),
+            "avg_heart_rate": d.get("avg_heart_rate"),
+            "max_heart_rate": d.get("max_heart_rate"),
+            "avg_speed_ms": d.get("avg_speed"),
+            "total_calories": d.get("total_calories"),
+        })
+    for msg in fitfile.get_messages("device_info"):
+        d = {f.name: f.value for f in msg.fields if f.value is not None}
+        meta["manufacturer"] = d.get("manufacturer")
+        meta["product"] = d.get("product")
+        break
 
     return meta
 
@@ -179,6 +178,10 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     # StandardUnitsDataProcessor converts FIT native meters to km — restore to meters
     if "distance_m" in df.columns:
         df["distance_m"] = df["distance_m"] * 1000
+
+    # StandardUnitsDataProcessor converts speed from m/s to km/h — restore to m/s
+    if "speed_ms" in df.columns:
+        df["speed_ms"] = df["speed_ms"] / 3.6
 
     # Sort by timestamp
     if "timestamp" in df.columns:
