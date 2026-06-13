@@ -16,9 +16,13 @@ change to detection parameters or when altitude was missing from old cache).
 
 from __future__ import annotations
 
+import gc
 import json
+import math
 import sys
 import time
+
+import numpy as np
 from pathlib import Path
 
 import pandas as pd
@@ -34,18 +38,24 @@ from analysis.efficiency import (
     zone_speed_ms,
 )
 from analysis.hr_analysis import DEFAULT_HR_ZONES, DEFAULT_MAX_HR
-from parsers.fit_parser import fit_metadata, parse_fit_file, parse_fit_laps
+from parsers.fit_parser import parse_fit_all
+from parsers.strava_zip import index_zip, parse_strava_activity
 
 SUMMARIES    = _ROOT / "data/summaries.parquet"
 FIT_DIR      = _ROOT / "data/fit"
 CACHE_FILE   = _ROOT / "data/efficiency_cache.json"
+
+# Strava bulk-export zip (Strava-only sessions — no Garmin FIT file)
+_strava_zips = sorted((_ROOT / "data").glob("export_*.zip"))
+_STRAVA_ZIP  = _strava_zips[0] if _strava_zips else None
+_STRAVA_IDX  = index_zip(_STRAVA_ZIP) if _STRAVA_ZIP else {}
 OUT_HTML     = _ROOT / "data/efficiency_report.html"
 
-_HILL_MIN_DPLUS = 1200.0
+_HILL_MIN_DPLUS = 400.0
 _TS_STEP_S      = 10
 
 # Cache schema version — bump when cache format changes to force rebuild
-_CACHE_VERSION = 2
+_CACHE_VERSION = 10
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +77,21 @@ def _save_cache(cache: dict) -> None:
 # ---------------------------------------------------------------------------
 # Strava name lookup (date-based)
 # ---------------------------------------------------------------------------
+
+def _load_races() -> dict[str, str]:
+    """Return {date: race_name} from races.json. Date format: YYYY-MM-DD."""
+    races_file = _ROOT / "data/races/races.json"
+    if not races_file.exists():
+        return {}
+    try:
+        races = json.loads(races_file.read_text(encoding="utf-8"))
+        return {
+            str(r.get("date", ""))[:10]: str(r.get("name") or "").strip()
+            for r in races if r.get("date")
+        }
+    except Exception:
+        return {}
+
 
 def _load_strava_names() -> dict[str, list[str]]:
     """
@@ -120,38 +145,108 @@ def _ts_arrays(df: pd.DataFrame, include_alt: bool = False) -> dict:
 # Session processing
 # ---------------------------------------------------------------------------
 
-def _session_name(fit_path: Path, date_str: str, strava_names: dict[str, list[str]]) -> str:
-    """Return the best available session name: FIT workout name > Strava name."""
-    try:
-        meta = fit_metadata(fit_path)
-        wkt = (meta.get("workout_name") or "").strip()
-        if wkt:
-            return wkt
-    except Exception:
-        pass
-    names = strava_names.get(date_str, [])
-    return names[0] if names else ""
+
+
+def _is_track_gps(df: pd.DataFrame) -> bool:
+    """
+    True if GPS trace looks like a track session.  Votes on three independent signals;
+    returns True when at least 2 of 3 agree.
+
+    Signal 1 — bounding-box ratio: total_distance / bbox_diagonal >= 10.
+      400m oval (≈190m diagonal) + 5km run → ratio ≈26.  Road 5km → ratio < 3.
+
+    Signal 2 — centroid spread: std of distance-from-centroid < 120m.
+      Track: all points within ~100m of centre.  Road run: spread over km.
+
+    Signal 3 — periodic lap returns: distance-from-start oscillates back toward
+      ~0 every 300-600m (one oval lap).  Count transitions into the near-start zone;
+      ≥ 3 qualifying returns confirms a looping structure.
+    """
+    if "lat" not in df.columns or "lon" not in df.columns:
+        return False
+    valid = df[df["lat"].notna() & df["lon"].notna()]
+    if len(valid) < 50:
+        return False
+
+    lat     = valid["lat"].values
+    lon     = valid["lon"].values
+    lat_ref = float(lat.mean())
+    lon_ref = float(lon.mean())
+    cos_lat = math.cos(math.radians(lat_ref))
+
+    # Cartesian offsets in metres
+    y = (lat - lat_ref) * 111_320
+    x = (lon - lon_ref) * 111_320 * cos_lat
+
+    # --- Signal 1: bounding-box ratio ---
+    bbox_diag = math.sqrt((y.max() - y.min()) ** 2 + (x.max() - x.min()) ** 2)
+    total_dist = float(df["distance_m"].max()) if "distance_m" in df.columns else 0
+    sig1 = bbox_diag > 50 and (total_dist / bbox_diag) >= 10
+
+    # --- Signal 2: centroid spread ---
+    dist_centroid = (y ** 2 + x ** 2) ** 0.5
+    sig2 = float(dist_centroid.std()) < 120.0
+
+    # --- Signal 3: periodic lap returns (~400m spacing) ---
+    sig3 = False
+    if "distance_m" in valid.columns:
+        sy = (lat - lat[0]) * 111_320
+        sx = (lon - lon[0]) * 111_320 * cos_lat
+        dist_start = (sy ** 2 + sx ** 2) ** 0.5
+        cum_dist   = valid["distance_m"].values
+
+        NEAR_M   = 60.0   # within 60m of start = "near"
+        MIN_LAP  = 300.0
+        MAX_LAP  = 600.0
+
+        laps = 0
+        last_return_cum = None
+        was_near = bool(dist_start[0] < NEAR_M)
+
+        for i in range(1, len(dist_start)):
+            near = bool(dist_start[i] < NEAR_M)
+            if near and not was_near:          # crossed back into near-start zone
+                if last_return_cum is None:
+                    last_return_cum = cum_dist[i]
+                else:
+                    lap_dist = cum_dist[i] - last_return_cum
+                    if MIN_LAP <= lap_dist <= MAX_LAP:
+                        laps += 1
+                    last_return_cum = cum_dist[i]
+            was_near = near
+
+        sig3 = laps >= 3
+
+    return sum([sig1, sig2, sig3]) >= 2
 
 
 def _process_track(fit_path: Path, strava_names: dict) -> dict | None:
-    """Parse FIT, detect intervals (laps preferred), compute zone speeds."""
+    """Parse FIT once, detect intervals (laps preferred), compute zone speeds."""
     try:
-        df = parse_fit_file(fit_path)
+        df, laps_df, wkt_steps, workout_name = parse_fit_all(fit_path)
     except Exception as e:
         print(f"  [skip] {fit_path.name}: {e}")
         return None
 
-    # Try structured lap data first
+    # No GPS → treadmill, skip
+    if "lat" not in df.columns or df["lat"].notna().sum() < 10:
+        return None
+
+    # track_running = user explicitly selected that sport → always trust adaptive fallback.
+    # running = generic label → only apply adaptive fallback if GPS confirms track pattern.
+    is_explicit_track = "track_running" in fit_path.name
+
+    has_manual_laps  = not laps_df.empty and (laps_df["trigger"] == "manual").sum() >= 2
+    has_workout_laps = not laps_df.empty and len(wkt_steps) >= 3
+
     used_laps = False
-    try:
-        laps_df = parse_fit_laps(fit_path)
-        if not laps_df.empty and (laps_df["intensity"] == "active").any():
-            intervals = detect_track_intervals_from_laps(laps_df)
-            used_laps = True
-        else:
-            intervals = detect_track_intervals(df)
-    except Exception:
+    if has_manual_laps or has_workout_laps:
+        intervals = detect_track_intervals_from_laps(laps_df, workout_steps=wkt_steps)
+        used_laps = True
+    elif is_explicit_track or _is_track_gps(df):
         intervals = detect_track_intervals(df)
+    else:
+        return None
 
     work = [i for i in intervals if i.is_work]
     if not work:
@@ -160,9 +255,10 @@ def _process_track(fit_path: Path, strava_names: dict) -> dict | None:
     eff_vals = [i.efficiency for i in work if i.efficiency]
     zone_sp  = zone_speed_ms(df, max_hr=DEFAULT_MAX_HR, zones=DEFAULT_HR_ZONES)
     date_str = fit_path.stem[:10]
+    name     = workout_name or (strava_names.get(date_str) or [""])[0]
 
     return {
-        "name": _session_name(fit_path, date_str, strava_names),
+        "name": name,
         "used_laps": used_laps,
         "intervals": [
             {
@@ -181,23 +277,18 @@ def _process_track(fit_path: Path, strava_names: dict) -> dict | None:
     }
 
 
-def _process_hills(fit_path: Path, strava_names: dict) -> dict | None:
-    """Parse FIT, detect hill repeats (with altitude in ts)."""
-    try:
-        df = parse_fit_file(fit_path)
-    except Exception as e:
-        print(f"  [skip] {fit_path.name}: {e}")
-        return None
-
+def _hills_from_df(df: pd.DataFrame, date_str: str, strava_names: dict,
+                   workout_name: str | None = None) -> dict | None:
+    """Core hill-repeat detection given a pre-parsed DataFrame."""
     repeats = detect_hill_repeats(df)
     if not repeats:
         return {"no_repeats": True}
 
     eff_vals = [r.efficiency for r in repeats if r.efficiency is not None]
-    date_str = fit_path.stem[:10]
+    name     = workout_name or (strava_names.get(date_str) or [""])[0]
 
     return {
-        "name": _session_name(fit_path, date_str, strava_names),
+        "name": name,
         "repeats": [
             {
                 "repeat_num": r.repeat_num,
@@ -217,6 +308,16 @@ def _process_hills(fit_path: Path, strava_names: dict) -> dict | None:
     }
 
 
+def _process_hills(fit_path: Path, strava_names: dict) -> dict | None:
+    """Parse Garmin FIT once, detect hill repeats."""
+    try:
+        df, _, _, workout_name = parse_fit_all(fit_path)
+    except Exception as e:
+        print(f"  [skip] {fit_path.name}: {e}")
+        return None
+    return _hills_from_df(df, fit_path.stem[:10], strava_names, workout_name)
+
+
 # ---------------------------------------------------------------------------
 # Main data pipeline
 # ---------------------------------------------------------------------------
@@ -234,54 +335,111 @@ def build_cache(rebuild: bool = False) -> dict:
 
     df = pd.read_parquet(SUMMARIES)
     strava_names = _load_strava_names()
+    races        = _load_races()
+    race_dates   = set(races.keys())
 
-    # Track sessions
-    track_df = df[df["sport"] == "track_running"].copy()
+    # Track sessions: explicit track_running + generic running with GPS (mislabelled track)
+    track_df = df[df["sport"].isin(["track_running", "running"])].copy()
     track_new = [
         r for _, r in track_df.iterrows()
         if r.get("file") and r["file"] not in cache["track"]
     ]
     if track_new:
-        print(f"Track sessions: {len(track_new)} new to process ({len(track_df)} total)...")
+        print(f"Track candidates: testing {len(track_new)} sessions (intervals detected after GPS/lap filtering)...")
+        counts = {"track_laps": 0, "track_adaptive": 0, "run_laps": 0, "run_gps": 0}
+
+        def _has_work(result):
+            return (result and result.get("intervals") and
+                    any(i["is_work"] and i.get("efficiency") for i in result["intervals"]))
+
         for row in tqdm(track_new, desc="Track", unit="session"):
             fp = FIT_DIR / row["file"]
             if not fp.exists():
                 continue
-            result = _process_track(fp, strava_names)
+            result   = _process_track(fp, strava_names)
             date_str = str(row.get("date", ""))[:10]
+            sport    = str(row.get("sport", "running"))
             cache["track"][row["file"]] = {
                 "date": date_str,
                 "distance_km": row.get("distance_km"),
-                "duration_s": row.get("duration_s"),
+                "duration_s":  row.get("duration_s"),
                 **(result or {"no_intervals": True}),
             }
-    else:
-        print(f"Track sessions: 0 new (cache has {len(cache['track'])} sessions).")
+            if _has_work(result):
+                is_track  = sport == "track_running"
+                used_laps = result.get("used_laps")
+                if   is_track and used_laps:  counts["track_laps"]     += 1
+                elif is_track:                counts["track_adaptive"] += 1
+                elif used_laps:               counts["run_laps"]       += 1
+                else:                         counts["run_gps"]        += 1
 
-    # Hill candidates
-    hill_candidates = df[
-        (df["sport"] == "trail_running") &
-        (df["dplus_m"].fillna(0) >= _HILL_MIN_DPLUS)
-    ].copy()
+            if len(cache["track"]) % 25 == 0:
+                gc.collect()
+
+        total = sum(counts.values())
+        print(f"Interval sessions: {total} kept (out of {len(track_new)} candidates tested)")
+        print(f"  {counts['track_laps']:3d} × track_running        + Garmin laps")
+        print(f"  {counts['track_adaptive']:3d} × track_running        + adaptive threshold (no laps)")
+        print(f"  {counts['run_laps']:3d} × running (road/track)  + Garmin laps")
+        print(f"  {counts['run_gps']:3d} × running               + adaptive threshold (GPS-confirmed track)")
+    else:
+        kept = sum(1 for v in cache["track"].values() if not v.get("no_intervals") and v.get("intervals"))
+        print(f"Track: 0 new candidates — {kept} sessions with intervals already cached.")
+
+    # Hill candidates — Garmin FIT + Strava-only sessions (if zip available)
+    garmin_hills = df[
+        (df["sport"].isin(["trail_running", "running"])) &
+        (df["dplus_m"].fillna(0) >= _HILL_MIN_DPLUS) &
+        (df["file"].str.endswith(".fit", na=False))
+    ]
+    strava_hills = df[
+        (df["sport"] == "Run") &
+        (df["dplus_m"].fillna(0) >= _HILL_MIN_DPLUS) &
+        (df["file"].str.endswith(".parquet", na=False)) &
+        (df["file"].str.replace(".parquet", "", regex=False).isin(_STRAVA_IDX))
+    ] if _STRAVA_ZIP else df.iloc[:0]
+
+    hill_candidates = pd.concat([garmin_hills, strava_hills], ignore_index=True)
     hills_new = [
         r for _, r in hill_candidates.iterrows()
         if r.get("file") and r["file"] not in cache["hills"]
     ]
     if hills_new:
-        print(f"Hill candidates: {len(hills_new)} new to check ({len(hill_candidates)} total)...")
-        for row in tqdm(hills_new, desc="Hills", unit="session"):
-            fp = FIT_DIR / row["file"]
-            if not fp.exists():
-                continue
-            result = _process_hills(fp, strava_names)
+        n_garmin = garmin_hills["file"].isin([r["file"] for r in hills_new]).sum()
+        n_strava = len(hills_new) - n_garmin
+        src_note = f"  ({n_garmin} Garmin FIT, {n_strava} Strava zip)" if n_strava else ""
+        print(f"Hill candidates: {len(hills_new)} new to check ({len(hill_candidates)} total){src_note}...")
+        for i, row in enumerate(tqdm(hills_new, desc="Hills", unit="session")):
+            file_ref = row["file"]
             date_str = str(row.get("date", ""))[:10]
-            cache["hills"][row["file"]] = {
+
+            if file_ref.endswith(".fit"):
+                fp = FIT_DIR / file_ref
+                if not fp.exists():
+                    cache["hills"][file_ref] = {"date": date_str, "no_repeats": True}
+                    continue
+                result = _process_hills(fp, strava_names)
+            else:
+                # Strava-only: parse GPS from zip
+                activity_id = file_ref.replace(".parquet", "")
+                try:
+                    df_s = parse_strava_activity(_STRAVA_ZIP, activity_id)
+                    result = _hills_from_df(df_s, date_str, strava_names) if not df_s.empty else None
+                except Exception as e:
+                    print(f"  [skip] {file_ref}: {e}")
+                    result = None
+
+            cache["hills"][file_ref] = {
                 "date": date_str,
                 "distance_km": row.get("distance_km"),
                 "duration_s": row.get("duration_s"),
                 "dplus_m": row.get("dplus_m"),
+                "is_race": date_str in race_dates,
+                "race_name": races.get(date_str, ""),
                 **(result or {"no_repeats": True}),
             }
+            if i % 25 == 0:
+                gc.collect()
     else:
         print(f"Hill sessions: 0 new (cache has {len(cache['hills'])} sessions).")
 
@@ -311,13 +469,30 @@ def _zone_color(zone: str) -> str:
     }.get(zone, "#636e72")
 
 
+_MIN_WORK_HR = 120  # below this during a work interval → HR sensor artifact
+
+
 def render_html(cache: dict) -> str:
     # Filter sessions with real results
-    track_sessions = {
+    raw_track = {
         f: d for f, d in sorted(cache.get("track", {}).items())
         if not d.get("no_intervals") and d.get("intervals")
         and any(i["is_work"] and i.get("efficiency") for i in d["intervals"])
     }
+    # Mask efficiency for work intervals with suspiciously low HR (sensor dropout)
+    track_sessions: dict = {}
+    for f, d in raw_track.items():
+        intervals2 = []
+        for iv in d.get("intervals", []):
+            iv2 = dict(iv)
+            if iv2.get("is_work") and iv2.get("efficiency") and (iv2.get("mean_hr") or 0) < _MIN_WORK_HR:
+                iv2["efficiency"] = None
+            intervals2.append(iv2)
+        valid_effs = [iv["efficiency"] for iv in intervals2 if iv.get("is_work") and iv.get("efficiency")]
+        d2 = dict(d, intervals=intervals2,
+                  mean_efficiency=round(sum(valid_effs)/len(valid_effs), 5) if valid_effs else None)
+        track_sessions[f] = d2
+
     hill_sessions = {
         f: d for f, d in sorted(cache.get("hills", {}).items())
         if not d.get("no_repeats") and d.get("repeats")
@@ -357,7 +532,43 @@ def render_html(cache: dict) -> str:
         if d.get("mean_efficiency")
     ]
 
+    # Scatter: one point per detected climb across all hill sessions
+    hill_scatter = []
+    for _, d in sorted(hill_sessions.items(), key=lambda x: x[1]["date"]):
+        yr = int(d["date"][:4]) if len(d.get("date", "")) >= 4 else 0
+        sess_name = d.get("name", "") or d.get("race_name", "") or ""
+        for r in d.get("repeats", []):
+            hr = r.get("mean_hr")
+            asc = r.get("asc_speed_mh")
+            if hr and asc and hr > 0:
+                hill_scatter.append({
+                    "x":     round(float(hr), 1),
+                    "y":     round(float(asc), 1),
+                    "year":  yr,
+                    "date":  d["date"],
+                    "grade": round(float(r.get("avg_grade_pct", 0)), 1),
+                    "dplus": round(float(r.get("dplus_m", 0)), 0),
+                    "name":  sess_name,
+                })
+
     zone_colors = {z: _zone_color(z) for z in DEFAULT_HR_ZONES}
+
+    _zone_scatter_colors = {
+        "Z1_recovery":  "rgba(116,185,255,0.10)",
+        "Z2_aerobic":   "rgba(0,184,148,0.10)",
+        "Z3_tempo":     "rgba(253,203,110,0.12)",
+        "Z4_threshold": "rgba(225,112,85,0.15)",
+        "Z5_vo2max":    "rgba(214,48,49,0.15)",
+    }
+    hr_zones_bpm = [
+        {
+            "label": z.split("_")[0],
+            "lo":    round(lo * DEFAULT_MAX_HR),
+            "hi":    round(hi * DEFAULT_MAX_HR),
+            "color": _zone_scatter_colors.get(z, "rgba(200,200,200,0.08)"),
+        }
+        for z, (lo, hi) in DEFAULT_HR_ZONES.items()
+    ]
     zone_labels = {
         "Z1_recovery": "Z1 Récup", "Z2_aerobic": "Z2 Aérobie",
         "Z3_tempo": "Z3 Tempo",   "Z4_threshold": "Z4 Seuil",
@@ -382,13 +593,19 @@ def render_html(cache: dict) -> str:
     def hill_item(fname, d):
         eff = d.get("mean_efficiency")
         eff_s = f"{eff:.2f}" if eff else "—"
-        name = d.get("name", "")
-        name_line = f'<span class="sess-name">{name}</span>' if name else ""
+        if d.get("is_race"):
+            race_name = d.get("race_name", "")
+            name_line = f'<span class="sess-name">{race_name}</span>' if race_name else ""
+            race_badge = ' <span class="race-badge">Course</span>'
+        else:
+            name = d.get("name", "")
+            name_line = f'<span class="sess-name">{name}</span>' if name else ""
+            race_badge = ""
         return (
             f'<div class="sess-item" data-file="{fname}" onclick="selectSession(this,\'hills\')">'
-            f'<span class="sess-date">{d["date"]}</span>'
+            f'<span class="sess-date">{d["date"]}{race_badge}</span>'
             f'{name_line}'
-            f'<span class="sess-meta">{d.get("repeat_count",0)} reps · {eff_s} asc/FC</span>'
+            f'<span class="sess-meta">{d.get("repeat_count",0)} montées · {eff_s} asc/FC</span>'
             f'</div>'
         )
 
@@ -477,6 +694,8 @@ def render_html(cache: dict) -> str:
                 font-size: 12px; font-weight: 600; }}
   .laps-badge {{ font-size: 10px; padding: 1px 6px; border-radius: 3px;
                  background: rgba(108,122,255,.25); color: #a0b0ff; margin-left: 6px; }}
+  .race-badge {{ font-size: 10px; padding: 1px 6px; border-radius: 3px;
+                 background: rgba(231,76,60,.25); color: #ff9f9f; margin-left: 6px; }}
 </style>
 </head>
 <body>
@@ -485,6 +704,7 @@ def render_html(cache: dict) -> str:
   <div class="tab-bar">
     <button class="tab active" onclick="switchTab('track',event)">Track</button>
     <button class="tab" onclick="switchTab('hills',event)">Hills</button>
+    <button class="tab" onclick="switchTab('scatter',event)">Montées ↗</button>
     <button class="tab" onclick="switchTab('zones',event)">Zone Speed</button>
   </div>
 </header>
@@ -539,6 +759,18 @@ def render_html(cache: dict) -> str:
       </div>
     </div>
 
+    <!-- SCATTER -->
+    <div id="panel-scatter" class="panel">
+      <div class="card">
+        <div class="card-title">Vitesse ascensionnelle (m/h) vs FC — toutes montées, couleur par année</div>
+        <div class="chart-wrap-tall"><canvas id="chart-hill-scatter"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Tendance linéaire par année — lire la vitesse cible à SV1 / SV2</div>
+        <div class="chart-wrap-tall"><canvas id="chart-hill-trends"></canvas></div>
+      </div>
+    </div>
+
     <!-- ZONES -->
     <div id="panel-zones" class="panel">
       <div class="card">
@@ -555,13 +787,15 @@ def render_html(cache: dict) -> str:
 
 <script>
 // ── embedded data ──────────────────────────────────────────────────────────
-const SESSIONS    = {sessions_js};
-const TRACK_TREND = {json.dumps(track_trend, ensure_ascii=False)};
-const HILL_TREND  = {json.dumps(hill_trend,  ensure_ascii=False)};
-const ZONE_YEARS  = {json.dumps(zone_years)};
-const ZONE_SERIES = {json.dumps(zone_series)};
-const ZONE_COLORS = {json.dumps(zone_colors)};
-const ZONE_LABELS = {json.dumps(zone_labels, ensure_ascii=False)};
+const SESSIONS     = {sessions_js};
+const TRACK_TREND  = {json.dumps(track_trend, ensure_ascii=False)};
+const HILL_TREND   = {json.dumps(hill_trend,  ensure_ascii=False)};
+const HILL_SCATTER  = {json.dumps(hill_scatter,  ensure_ascii=False)};
+const HR_ZONES_BPM  = {json.dumps(hr_zones_bpm, ensure_ascii=False)};
+const ZONE_YEARS   = {json.dumps(zone_years)};
+const ZONE_SERIES  = {json.dumps(zone_series)};
+const ZONE_COLORS  = {json.dumps(zone_colors)};
+const ZONE_LABELS  = {json.dumps(zone_labels, ensure_ascii=False)};
 
 // ── custom plugin: grey band overlay (work intervals / hill repeats) ───────
 const workBandsPlugin = {{
@@ -699,7 +933,7 @@ function renderTrack(data) {{
   const ivs  = data.intervals || [];
   const work = ivs.filter(i => i.is_work);
   const eff  = data.mean_efficiency ? (data.mean_efficiency*1000).toFixed(2) : '—';
-  const lbl  = data.used_laps ? '<span class="laps-badge">laps GPS</span>' : '';
+  const lbl  = data.used_laps ? '<span class="laps-badge">laps Garmin</span>' : '';
   document.getElementById('track-detail').innerHTML = `
     ${{data.name ? `<div class="sess-label">${{data.name}}</div>` : ''}}
     <h2 class="sess-heading">${{data.date}}${{lbl}}</h2>
@@ -708,14 +942,31 @@ function renderTrack(data) {{
       <div class="stat"><div class="stat-val">${{eff}}</div><div class="stat-lbl">économie ×1000</div></div>
       <div class="stat"><div class="stat-val">${{work.length}}</div><div class="stat-lbl">blocs</div></div>
     </div>
-    <table>
-      <tr><th>#</th><th>Durée</th><th>Vit. km/h</th><th>FC moy (bpm)</th><th>Éco = vit/FC ×1000</th></tr>
-      ${{work.map((iv,i) => `<tr class="work-row">
-        <td>${{i+1}}</td><td>${{fmtMin(iv.duration_s)}}</td><td>${{iv.speed_kmh.toFixed(2)}}</td>
-        <td>${{iv.mean_hr ? iv.mean_hr.toFixed(0) : '—'}}</td>
-        <td><span class="eff-badge" style="background:${{effColor(iv.efficiency,'track')}}">${{iv.efficiency ? (iv.efficiency*1000).toFixed(2) : '—'}}</span></td>
-      </tr>`).join('')}}
-    </table>`;
+    ${{(() => {{
+      const ref = work.find(iv => iv.efficiency)?.efficiency || null;
+      const rows = work.map((iv, i) => {{
+        const eco = iv.efficiency ? (iv.efficiency*1000).toFixed(2) : '—';
+        const pct = (ref && iv.efficiency)
+          ? ((iv.efficiency / ref) * 100).toFixed(1) + '%'
+          : '—';
+        const pctColor = (ref && iv.efficiency)
+          ? (iv.efficiency/ref >= 0.98 ? 'rgba(46,204,113,.35)'
+           : iv.efficiency/ref >= 0.93 ? 'rgba(253,203,110,.35)'
+           : 'rgba(214,63,49,.35)')
+          : 'transparent';
+        return `<tr class="work-row">
+          <td>${{i+1}}</td><td>${{fmtMin(iv.duration_s)}}</td><td>${{iv.speed_kmh.toFixed(2)}}</td>
+          <td>${{iv.mean_hr ? iv.mean_hr.toFixed(0) : '—'}}</td>
+          <td><span class="eff-badge" style="background:${{effColor(iv.efficiency,'track')}}">${{eco}}</span></td>
+          <td><span class="eff-badge" style="background:${{pctColor}}">${{pct}}</span></td>
+        </tr>`;
+      }});
+      return `<table>
+        <tr><th>#</th><th>Durée</th><th>Vit. km/h</th><th>FC moy (bpm)</th><th>Éco ×1000</th><th>Maintien</th></tr>
+        ${{rows.join('')}}
+      </table>`;
+    }})()}}
+    `;
 
   const ts = data.ts || {{}};
   if (ts.t?.length) {{
@@ -756,13 +1007,17 @@ function renderTrack(data) {{
 function renderHills(data) {{
   const reps = data.repeats || [];
   const eff  = data.mean_efficiency ? data.mean_efficiency.toFixed(2) : '—';
+  const raceLbl = data.is_race ? ' <span class="race-badge">Course</span>' : '';
+  const topLabel = data.is_race && data.race_name
+    ? `<div class="sess-label">${{data.race_name}}</div>`
+    : (data.name ? `<div class="sess-label">${{data.name}}</div>` : '');
   document.getElementById('hills-detail').innerHTML = `
-    ${{data.name ? `<div class="sess-label">${{data.name}}</div>` : ''}}
-    <h2 class="sess-heading">${{data.date}}</h2>
-    <div class="sess-subheading">${{data.distance_km || '—'}} km · ${{fmtHms(data.duration_s)}} · ${{data.dplus_m ? Math.round(data.dplus_m)+'m D+' : ''}} · ${{reps.length}} reps</div>
+    ${{topLabel}}
+    <h2 class="sess-heading">${{data.date}}${{raceLbl}}</h2>
+    <div class="sess-subheading">${{data.distance_km || '—'}} km · ${{fmtHms(data.duration_s)}} · ${{data.dplus_m ? Math.round(data.dplus_m)+'m D+' : ''}} · ${{reps.length}} montées</div>
     <div class="stat-row">
       <div class="stat"><div class="stat-val">${{eff}}</div><div class="stat-lbl">éco (asc/FC)</div></div>
-      <div class="stat"><div class="stat-val">${{reps.length}}</div><div class="stat-lbl">répétitions</div></div>
+      <div class="stat"><div class="stat-val">${{reps.length}}</div><div class="stat-lbl">montées</div></div>
       <div class="stat"><div class="stat-val">${{reps.length ? Math.round(reps[0].dplus_m) : '—'}}</div><div class="stat-lbl">D+ rep1 (m)</div></div>
     </div>
     <table>
@@ -812,8 +1067,14 @@ function renderHills(data) {{
 }}
 
 // ── time series charts ─────────────────────────────────────────────────────
+function fmtAxis(s) {{
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.round(s%60);
+  return h > 0
+    ? `${{h}}:${{String(m).padStart(2,'0')}}:${{String(sec).padStart(2,'0')}}`
+    : `${{m}}:${{String(sec).padStart(2,'0')}}`;
+}}
 function buildTrackTs(id, ts, bands) {{
-  const labels = ts.t.map(s => fmtMin(s));
+  const labels = ts.t.map(s => fmtAxis(s));
   mkChart(id, {{
     type: 'line',
     data: {{
@@ -846,7 +1107,7 @@ function buildTrackTs(id, ts, bands) {{
 }}
 
 function buildHillsTs(id, ts, bands) {{
-  const labels = ts.t.map(s => fmtMin(s));
+  const labels = ts.t.map(s => fmtAxis(s));
   const hasAlt = ts.alt?.length > 0;
   const datasets = [];
   if (hasAlt) {{
@@ -894,10 +1155,12 @@ function switchTab(tab, ev) {{
   document.getElementById('sidebar-track').style.display = tab === 'track' ? '' : 'none';
   document.getElementById('sidebar-hills').style.display = tab === 'hills' ? '' : 'none';
   document.getElementById('sidebar-label').textContent = {{
-    track: 'Track ({len(track_sessions)})',
-    hills: 'Hills ({len(hill_sessions)})',
-    zones: 'Zone Speed',
+    track:   'Track ({len(track_sessions)})',
+    hills:   'Hills ({len(hill_sessions)})',
+    scatter: 'Montées',
+    zones:   'Zone Speed',
   }}[tab] || '';
+  if (tab === 'scatter') buildHillScatterOnce();
 }}
 
 // ── formatting helpers ─────────────────────────────────────────────────────
@@ -909,6 +1172,151 @@ function fmtHms(s) {{
   if (!s) return '—';
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
   return h ? `${{h}}h${{String(m).padStart(2,'0')}}` : `${{m}}min`;
+}}
+
+// ── shared helpers for hill scatter + trend charts ─────────────────────────
+const _scatterPalette = [
+  '#74b9ff','#00b894','#fdcb6e','#e17055','#d63031',
+  '#6c5ce7','#fd79a8','#00cec9','#a29bfe','#55efc4',
+  '#fab1a0','#81ecec',
+];
+const _scatterYears    = [...new Set(HILL_SCATTER.map(p => p.year))].sort();
+const _scatterYearColor = Object.fromEntries(
+  _scatterYears.map((y, i) => [y, _scatterPalette[i % _scatterPalette.length]])
+);
+
+const hrZoneBandsPlugin = {{
+  id: 'hrZoneBands',
+  beforeDraw(chart) {{
+    const {{ ctx, chartArea: {{ top, bottom }}, scales: {{ x }} }} = chart;
+    for (const z of HR_ZONES_BPM) {{
+      const x1 = x.getPixelForValue(z.lo);
+      const x2 = x.getPixelForValue(z.hi);
+      ctx.save();
+      ctx.fillStyle = z.color;
+      ctx.fillRect(x1, top, x2 - x1, bottom - top);
+      ctx.fillStyle = 'rgba(200,207,255,0.45)';
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(z.label, (x1 + x2) / 2, top + 13);
+      ctx.restore();
+    }}
+  }},
+}};
+
+function _linReg(pts) {{
+  const n = pts.length;
+  if (n < 3) return null;
+  const sx = pts.reduce((s, p) => s + p.x, 0);
+  const sy = pts.reduce((s, p) => s + p.y, 0);
+  const sxy = pts.reduce((s, p) => s + p.x * p.y, 0);
+  const sx2 = pts.reduce((s, p) => s + p.x * p.x, 0);
+  const denom = n * sx2 - sx * sx;
+  if (!denom) return null;
+  const m = (n * sxy - sx * sy) / denom;
+  const b = (sy - m * sx) / n;
+  return {{ m, b }};
+}}
+
+// ── hill scatter ────────────────────────────────────────────────────────────
+let _hillScatterBuilt = false;
+function buildHillScatterOnce() {{
+  if (_hillScatterBuilt) return;
+  _hillScatterBuilt = true;
+
+  const datasets = _scatterYears.map(yr => ({{
+    label: String(yr),
+    data: HILL_SCATTER.filter(p => p.year === yr).map(p => ({{ x: p.x, y: p.y, raw: p }})),
+    backgroundColor: _scatterYearColor[yr] + 'cc',
+    borderColor:     _scatterYearColor[yr],
+    borderWidth: 1, pointRadius: 5, pointHoverRadius: 7,
+  }}));
+
+  new Chart(document.getElementById('chart-hill-scatter'), {{
+    type: 'scatter',
+    data: {{ datasets }},
+    plugins: [hrZoneBandsPlugin],
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      plugins: {{
+        tooltip: {{
+          callbacks: {{
+            label(ctx) {{
+              const p = ctx.raw.raw;
+              return [
+                `${{p.date}} — ${{p.name || ''}}`,
+                `FC ${{p.x}} bpm  |  vit.asc. ${{p.y}} m/h`,
+                `Pente ${{p.grade}}%  |  D+ ${{p.dplus}}m`,
+              ];
+            }},
+          }},
+        }},
+        legend: {{ position: 'bottom', labels: {{ color: '#c8cfff', boxWidth: 12 }} }},
+      }},
+      scales: {{
+        x: {{ title: {{ display: true, text: 'FC (bpm)', color: '#9ba4cc' }},
+               ticks: {{ color: '#9ba4cc' }}, grid: {{ color: 'rgba(255,255,255,.07)' }} }},
+        y: {{ title: {{ display: true, text: 'Vit. ascensionnelle (m/h)', color: '#9ba4cc' }},
+               ticks: {{ color: '#9ba4cc' }}, grid: {{ color: 'rgba(255,255,255,.07)' }} }},
+      }},
+    }},
+  }});
+
+  // ── trend lines ────────────────────────────────────────────────────────────
+  const allX = HILL_SCATTER.map(p => p.x);
+  const xMin = Math.floor(Math.min(...allX) / 5) * 5;
+  const xMax = Math.ceil(Math.max(...allX) / 5) * 5;
+
+  const trendDatasets = [];
+  for (const yr of _scatterYears) {{
+    const pts = HILL_SCATTER.filter(p => p.year === yr);
+    const reg = _linReg(pts);
+    if (!reg) continue;
+    const y0 = reg.m * xMin + reg.b;
+    const y1 = reg.m * xMax + reg.b;
+    trendDatasets.push({{
+      label: String(yr),
+      data: [{{ x: xMin, y: Math.max(0, y0) }}, {{ x: xMax, y: Math.max(0, y1) }}],
+      borderColor:     _scatterYearColor[yr],
+      backgroundColor: 'transparent',
+      borderWidth: 2.5,
+      pointRadius: 0,
+      tension: 0,
+      showLine: true,
+    }});
+  }}
+
+  new Chart(document.getElementById('chart-hill-trends'), {{
+    type: 'scatter',
+    data: {{ datasets: trendDatasets }},
+    plugins: [hrZoneBandsPlugin],
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      plugins: {{
+        tooltip: {{
+          callbacks: {{
+            label(ctx) {{
+              const yr = ctx.dataset.label;
+              const pts = HILL_SCATTER.filter(p => p.year === parseInt(yr));
+              const reg = _linReg(pts);
+              if (!reg) return '';
+              const fc = Math.round(ctx.parsed.x);
+              const v  = Math.round(reg.m * fc + reg.b);
+              return `${{yr}} @ FC ${{fc}} bpm → ${{v}} m/h`;
+            }},
+          }},
+        }},
+        legend: {{ position: 'bottom', labels: {{ color: '#c8cfff', boxWidth: 12 }} }},
+      }},
+      scales: {{
+        x: {{ type: 'linear', min: xMin, max: xMax,
+               title: {{ display: true, text: 'FC (bpm)', color: '#9ba4cc' }},
+               ticks: {{ color: '#9ba4cc' }}, grid: {{ color: 'rgba(255,255,255,.07)' }} }},
+        y: {{ title: {{ display: true, text: 'Vit. ascensionnelle (m/h)', color: '#9ba4cc' }},
+               ticks: {{ color: '#9ba4cc' }}, grid: {{ color: 'rgba(255,255,255,.07)' }} }},
+      }},
+    }},
+  }});
 }}
 
 // ── efficiency colour (percentile-based, red/yellow/green) ─────────────────
@@ -936,9 +1344,17 @@ def main():
     p = argparse.ArgumentParser(description="Generate efficiency_report.html")
     p.add_argument("--rebuild-cache", action="store_true",
                    help="Re-parse all sessions (needed after parameter or format changes)")
+    p.add_argument("--html-only", action="store_true",
+                   help="Skip cache build, just regenerate HTML from existing cache")
     args = p.parse_args()
 
-    cache = build_cache(rebuild=args.rebuild_cache)
+    if args.html_only:
+        cache = _load_cache()
+        if not cache.get("track") and not cache.get("hills"):
+            print("No valid cache found — run without --html-only first.")
+            sys.exit(1)
+    else:
+        cache = build_cache(rebuild=args.rebuild_cache)
 
     n_trk = sum(1 for d in cache["track"].values() if not d.get("no_intervals") and d.get("intervals"))
     n_hls = sum(1 for d in cache["hills"].values() if not d.get("no_repeats") and d.get("repeats"))

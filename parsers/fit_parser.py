@@ -104,6 +104,103 @@ def fit_metadata(path: str | Path) -> dict:
     return meta
 
 
+def parse_fit_all(path: "str | Path | bytes") -> tuple["pd.DataFrame", "pd.DataFrame", list[dict], str | None]:
+    """
+    Parse a FIT file in a single pass.
+
+    Parameters
+    ----------
+    path : str, Path, or bytes
+        Path to a .fit file, or raw FIT bytes (e.g. from a decompressed .fit.gz).
+
+    Returns
+    -------
+    df            : record time-series DataFrame (same as parse_fit_file)
+    laps_df       : lap DataFrame (same as parse_fit_laps)
+    workout_steps : list of dicts (same as parse_fit_workout_steps)
+    workout_name  : wkt_name string or None
+    """
+    import io as _io
+    _require_fitparse()
+    if isinstance(path, (bytes, bytearray)):
+        fileish = _io.BytesIO(bytes(path))
+    else:
+        path = Path(path)
+        fileish = str(path)
+    fitfile = fitparse.FitFile(
+        fileish, data_processor=fitparse.StandardUnitsDataProcessor()
+    )
+
+    records: list[dict] = []
+    lap_rows: list[dict] = []
+    wkt_steps: list[dict] = []
+    workout_name: str | None = None
+    t0 = None
+
+    for msg in fitfile.get_messages():
+        name = msg.name
+
+        if name == "record":
+            row: dict = {}
+            for field in msg.fields:
+                mapped = _FIELD_MAP.get(field.name)
+                if mapped and field.value is not None:
+                    row[mapped] = field.value
+            if row:
+                records.append(row)
+
+        elif name == "lap":
+            d = {f.name: f.value for f in msg.fields if f.value is not None}
+            start_t = d.get("start_time")
+            if t0 is None and start_t:
+                t0 = start_t
+            start_s = (start_t - t0).total_seconds() if (start_t and t0) else 0.0
+            dur   = float(d.get("total_elapsed_time") or 0)
+            dist  = float(d.get("total_distance") or 0)
+            speed_ms = dist / dur if dur > 1 else 0.0
+            step_idx = d.get("wkt_step_index")
+            if hasattr(step_idx, "value"):
+                step_idx = step_idx.value
+            lap_rows.append({
+                "start_s":        round(start_s, 1),
+                "duration_s":     round(dur, 1),
+                "end_s":          round(start_s + dur, 1),
+                "distance_m":     round(dist, 1),
+                "avg_speed_ms":   round(speed_ms, 3),
+                "avg_hr":         d.get("avg_heart_rate"),
+                "intensity":      str(d.get("intensity") or "").lower(),
+                "trigger":        str(d.get("lap_trigger") or "").lower(),
+                "wkt_step_index": step_idx,
+            })
+
+        elif name == "workout_step":
+            d = {f.name: f.value for f in msg.fields if f.value is not None}
+            idx = d.get("message_index")
+            if hasattr(idx, "value"):
+                idx = idx.value
+            target_type = str(d.get("target_type") or "").lower().replace(" ", "_")
+            wkt_steps.append({
+                "step_index":        int(idx) if idx is not None else len(wkt_steps),
+                "intensity":         str(d.get("intensity") or "").lower(),
+                "target_type":       target_type,
+                "target_value":      d.get("target_value"),
+                # Garmin uses custom_target_* instead of target_value when the user
+                # defines a custom zone range.  Capture high end of each range for use
+                # as an "effective target" in work/recovery classification.
+                "custom_hr_high":    d.get("custom_target_heart_rate_high"),
+                "custom_speed_high": d.get("custom_target_speed_high"),
+            })
+
+        elif name == "workout" and workout_name is None:
+            d = {f.name: f.value for f in msg.fields if f.value is not None}
+            workout_name = d.get("wkt_name") or None
+
+    del fitfile  # fitparse holds all messages in memory; release explicitly
+    df      = _clean(_records_to_dataframe(records))
+    laps_df = pd.DataFrame(lap_rows) if lap_rows else pd.DataFrame()
+    return df, laps_df, wkt_steps, workout_name
+
+
 def parse_fit_laps(path: str | Path) -> pd.DataFrame:
     """
     Return one row per lap message from a FIT file.
@@ -111,6 +208,7 @@ def parse_fit_laps(path: str | Path) -> pd.DataFrame:
     Useful for track sessions where the watch records each interval/recovery
     as a distinct lap with an intensity label (active / warmup / rest / cooldown).
     Distances are in metres, speeds derived from distance ÷ elapsed time.
+    wkt_step_index links each lap to its workout step (for target-based classification).
     """
     _require_fitparse()
     path = Path(path)
@@ -130,17 +228,48 @@ def parse_fit_laps(path: str | Path) -> pd.DataFrame:
         dist = float(d.get("total_distance") or 0)  # metres (no unit conversion needed)
         # avg_speed from Garmin is often 0 for track laps; compute from dist/time
         speed_ms = dist / dur if dur > 1 else 0.0
+        step_idx = d.get("wkt_step_index")
+        if hasattr(step_idx, "value"):
+            step_idx = step_idx.value
         rows.append({
-            "start_s":    round(start_s, 1),
-            "duration_s": round(dur, 1),
-            "end_s":      round(start_s + dur, 1),
-            "distance_m": round(dist, 1),
-            "avg_speed_ms": round(speed_ms, 3),
-            "avg_hr":     d.get("avg_heart_rate"),
-            "intensity":  str(d.get("intensity") or "").lower(),
-            "trigger":    str(d.get("lap_trigger") or "").lower(),
+            "start_s":       round(start_s, 1),
+            "duration_s":    round(dur, 1),
+            "end_s":         round(start_s + dur, 1),
+            "distance_m":    round(dist, 1),
+            "avg_speed_ms":  round(speed_ms, 3),
+            "avg_hr":        d.get("avg_heart_rate"),
+            "intensity":     str(d.get("intensity") or "").lower(),
+            "trigger":       str(d.get("lap_trigger") or "").lower(),
+            "wkt_step_index": step_idx,
         })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def parse_fit_workout_steps(path: str | Path) -> list[dict]:
+    """
+    Return one dict per workout_step message from a FIT file.
+
+    Keys: step_index (int), intensity (str), target_type (str), target_value (float|None).
+    Returns empty list if the file has no structured workout.
+    """
+    _require_fitparse()
+    path = Path(path)
+    fitfile = fitparse.FitFile(str(path))
+
+    steps: list[dict] = []
+    for msg in fitfile.get_messages("workout_step"):
+        d = {f.name: f.value for f in msg.fields if f.value is not None}
+        idx = d.get("message_index")
+        if hasattr(idx, "value"):
+            idx = idx.value
+        target_type = str(d.get("target_type") or "").lower().replace(" ", "_")
+        steps.append({
+            "step_index":   int(idx) if idx is not None else len(steps),
+            "intensity":    str(d.get("intensity") or "").lower(),
+            "target_type":  target_type,
+            "target_value": d.get("target_value"),
+        })
+    return steps
 
 
 # ---------------------------------------------------------------------------

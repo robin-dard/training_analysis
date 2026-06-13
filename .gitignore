@@ -7,6 +7,7 @@ data/strava_streams/
 data/*.json
 data/*.parquet
 data/*.html
+data/*.zip
 data/races/races.json
 
 # Sync state & token caches
